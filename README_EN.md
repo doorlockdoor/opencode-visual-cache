@@ -1,13 +1,3 @@
-<div align="center">
-<strong>
-    <h1>OpenCode Visual Cache</h1>
-    Real-time Token Cache Hit Rate · TPS Token Generation Speed · TUI Sidebar Visualization<br>
-    Adaptive Theme Colors · Auto-desaturated Design Language · Chinese / English Bilingual
-</strong>
-<br>
-
----
-
 ## Introduction
 
 Vibe-forked from opencode-visual-cache, adding first-token latency (TTFT), generation speed (TPS), and more.

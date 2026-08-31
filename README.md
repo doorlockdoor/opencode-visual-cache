@@ -1,18 +1,8 @@
-<div align="center">
-<strong>
-    <h1>OpenCode Visual Cache</h1>
-    实时 Token 缓存命中率 · TPS Token生成速度 · TUI 侧边栏可视化<br>
-    自适应主题色 · 自动低饱和设计语言 · 支持中/英双语
-</strong>
-<br>
-
----
-
 ## 介绍
 
 Vibe自opencode-visual-cache，新增首字延迟（TTFT），生成速度（TPS）等信息。
 
-<div align="center"> 
+<div align="center">
 <img src="https://raw.githubusercontent.com/doorlockdoor/opencode-visual-cache/master/assets/screen_shot_2026-08-31_170417.png"></img>
 </div>
 
