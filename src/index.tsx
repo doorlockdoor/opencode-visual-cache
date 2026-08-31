@@ -223,6 +223,12 @@ function fmtCost(n: number, symbol = "$", rate = 1): string {
   return symbol + v.toFixed(4)
 }
 
+/** 时长格式化：<1s 显示 "834ms"，否则 "1.2s"。 */
+function fmtMs(ms: number): string {
+  if (ms < 1000) return Math.round(ms) + "ms"
+  return (ms / 1000).toFixed(1) + "s"
+}
+
 // ── token estimation ──
 // Character-based BPE approximation.  Default ratios (~4 ASCII or ~1.5 CJK
 // chars per token) work well for natural language but systematically
@@ -272,6 +278,40 @@ interface TokenDist {
   apiInput: number  // API exact total input context (input + cache read + cache write)
   stepCost: number  // last step-finish part cost (USD) in the current round
   stepCount: number // step-finish parts count across the current round (parentID chain)
+}
+
+// ── performance (TTFT / TPS / latency) ──
+// 在 opencode-throughput / opencode-tokenwatch 口径基础上的修正版：
+//   TTFT   = 首个内容 part (text/reasoning) 的 time.start − message.time.created
+//            （体感口径：含 DB 写、工具注册解析、git 快照、HTTP 建连与重试等待等
+//             本地预处理开销，略大于 provider 报告的 TTFT）
+//   净生成 = time.completed − 首个 part start − 工具执行窗口∩生成区间
+//   TPS    = output tokens / 净生成 × 1000
+//   延迟   = time.completed − time.created − 工具执行窗口∩生成区间（净模型耗时）
+// 修正点（与 throughput/tokenwatch 的差异）：
+//   1. 取最早的 part 时间而非最后一个，避免把后续 part 误当首个而高估 TTFT（tokenwatch）
+//   2. opencode 的 time.completed 在流 drain 完（含工具执行产出 tool-result）后才写入，
+//      故按 tool part 的 state.time.start/end（区间合并去重）扣除工具等待，
+//      工具密集的 step 不再拉低 TPS / 拉高延迟；首内容前的服务端工具时间计入 TTFT
+//   3. 压缩（summary）消息与纯工具 step（无内容 part）不计入样本，三个指标样本集一致
+//   4. 非流式/缓冲网关（生成窗口 <30ms 或 <0.2ms/token）时 TPS 记 null 而非输出虚高值
+// 状态驱动：消息与 part 的时间戳持久化在数据库中，直接响应式推导——
+// 历史会话与子代理会话自动生效，无需事件监听、缓存或文件日志。
+interface PerfStats {
+  ttftLast: number | null // 最近一次首字延迟 (ms)
+  tpsLast: number | null  // 最近一次输出速度 (tok/s)
+  latLast: number | null  // 最近一次净模型延迟 (ms，已扣工具执行窗口)
+  ttftAvg: number | null  // 会话平均首字延迟 (ms)
+  tpsAvg: number | null   // 会话平均输出速度 (tok/s)
+  latAvg: number | null   // 会话平均净模型延迟 (ms)
+  ttftN: number           // 有效样本数（TTFT/TPS/延迟共用；压缩消息与纯工具 step 不计）
+  hasPerf: boolean        // 是否存在有效样本
+}
+
+const EMPTY_PERF: PerfStats = {
+  ttftLast: null, tpsLast: null, latLast: null,
+  ttftAvg: null, tpsAvg: null, latAvg: null,
+  ttftN: 0, hasPerf: false,
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +471,8 @@ interface PanelSignals {
   setSectionDist: (v: boolean) => void
   sectionSkills: () => boolean
   setSectionSkills: (v: boolean) => void
+  sectionPerf: () => boolean
+  setSectionPerf: (v: boolean) => void
   sectionBalance: () => boolean
   setSectionBalance: (v: boolean) => void
   /** Bottom status bar (prompt hint line) visibility. */
@@ -496,6 +538,7 @@ function TokenCachePanel(props: {
   const [modelOpen, setModelOpen] = createSignal(true)
   const [distOpen, setDistOpen] = createSignal(false)
   const [skillsOpen, setSkillsOpen] = createSignal(true)
+  const [perfOpen, setPerfOpen] = createSignal(true)
   const [balanceOpen, setBalanceOpen] = createSignal(false)
   let boxEl: any
 
@@ -514,6 +557,7 @@ function TokenCachePanel(props: {
     sectionModel, setSectionModel,
     sectionDist, setSectionDist,
     sectionSkills, setSectionSkills,
+    sectionPerf, setSectionPerf,
     sectionBalance, setSectionBalance,
     balanceRefresh,
     balanceProviderId, setBalanceProviderId,
@@ -570,6 +614,13 @@ function TokenCachePanel(props: {
   })
   const [lastHasDist, setLastHasDist] = createSignal(false)
 
+  // ── performance snapshot ──────────────────────────────────────
+  // 与 dist 相同的防闪烁策略：api.state.part() 在视图切换后重新水合前，
+  // hasPerf 会短暂翻转为 false；保留最近一次有效性能聚合（含跨重挂载的
+  // KV 快照）让 UI 保持稳定，直到下一次成功计算到来。
+  const [lastPerf, setLastPerf] = createSignal<PerfStats>({ ...EMPTY_PERF })
+  const [lastHasPerf, setLastHasPerf] = createSignal(false)
+
   const [dataSignal, setDataSignal] = createSignal<any>({
     hitRate: 0, read: 0, write: 0, freshInput: 0, output: 0,
     cost: 0, saved: 0, model: "", inputRate: 0, cacheReadRate: 0, cacheWriteRate: 0,
@@ -577,6 +628,8 @@ function TokenCachePanel(props: {
     providerName: "", sessionHitRate: 0,
     dist: { system: 0, user: 0, agent: 0, toolCall: 0, toolResult: 0, output: 0, reasoning: 0, apiOutput: 0, apiInput: 0, stepCost: 0, stepCount: 0 },
     hasDistData: false,
+    perf: { ...EMPTY_PERF },
+    hasPerf: false,
     skills: [] as { name: string; tokens: number }[],
     hasSkills: false,
   })
@@ -695,6 +748,7 @@ function TokenCachePanel(props: {
     const distData = untrack(() => {
       let dist: TokenDist = { system: 0, user: 0, agent: 0, toolCall: 0, toolResult: 0, output: 0, reasoning: 0, apiOutput: 0, apiInput: 0, stepCost: 0, stepCount: 0 }
       let hasDistData = false
+      let perf: PerfStats = { ...EMPTY_PERF }
       const loadedSkills = new Map<string, { name: string; tokens: number }>()
       try {
         const cfg = props.api.state.config as Record<string, unknown>
@@ -717,9 +771,19 @@ function TokenCachePanel(props: {
             dist.output += num(am.tokens?.output)
             dist.reasoning += num(am.tokens?.reasoning)
             let parts: readonly Part[] = []; try { parts = props.api.state.part(msg.id) } catch {}
+            // 首个内容 part (text/reasoning) 的开始时间 = 首 token 到达时刻；
+            // 取最早值（tokenwatch 修正：避免把后续 part 误当首个而高估 TTFT）
+            let firstStart: number | undefined
+            // 工具执行窗口 [start, end] 列表（仅 completed/error 有完整时间）
+            let toolIvs: [number, number][] | null = null
             for (const p of parts) {
               if (p.type === "tool") {
                 const tp = p as any; let rawInput = ""
+                const tw = tp.state?.time
+                if (typeof tw?.start === "number" && tw.start > 0 && typeof tw.end === "number" && tw.end > tw.start) {
+                  toolIvs ??= []
+                  toolIvs.push([tw.start, tw.end])
+                }
                 try { rawInput = tp.state.raw ?? (tp.state.input != null ? JSON.stringify(tp.state.input) : "") } catch {}
                 if (rawInput) dist.toolCall += estimateTokens(rawInput)
                 // 子代理委托（task 工具）：任务描述计入子代理指令（1.15.x 无 subtask part）
@@ -750,6 +814,49 @@ function TokenCachePanel(props: {
                   }
                 }
               } else if (p.type === "subtask") { const sub = p as any; dist.agent += estimateTokens(sub.prompt || sub.description || "") }
+              else if (p.type === "text" || p.type === "reasoning") {
+                const st = p.time?.start
+                if (typeof st === "number" && st > 0 && (firstStart === undefined || st < firstStart)) firstStart = st
+              }
+            }
+            // 已完成、无错误、非压缩、且有内容 part 的请求 → 计入性能样本
+            // （流式中 / 失败 / 零输出 / 压缩 summary / 纯工具 step 不计，三个指标样本集一致）
+            const created = am.time?.created
+            const completed = am.time?.completed
+            const outputTok = num(am.tokens?.output)
+            if (created && completed && !am.error && !am.summary && outputTok > 0
+              && firstStart !== undefined && firstStart > created) {
+              const fs = firstStart
+              // 合并工具执行窗口（并行工具区间重叠），扣除与生成区间的交集
+              let toolMs = 0
+              if (toolIvs) {
+                toolIvs.sort((a, b) => a[0] - b[0])
+                let ms = 0, ws = -1, we = -1
+                for (const [s, e] of toolIvs) {
+                  const lo = Math.max(s, fs), hi = Math.min(e, completed)
+                  if (hi <= lo) continue
+                  if (ws < 0) { ws = lo; we = hi }
+                  else if (lo <= we) { if (hi > we) we = hi }
+                  else { ms += we - ws; ws = lo; we = hi }
+                }
+                if (ws >= 0) ms += we - ws
+                toolMs = ms
+              }
+              const ttft = fs - created
+              const genMs = Math.max(0, completed - fs - toolMs)
+              const latency = Math.max(0, completed - created - toolMs)
+              // 非流式/缓冲网关守卫：生成窗口 <30ms 或 <0.2ms/token 时不可信 → TPS 记 null
+              const tps = genMs >= Math.max(30, outputTok / 5) ? (outputTok / genMs) * 1000 : null
+              perf.ttftN++
+              perf.latLast = latency
+              perf.latAvg = perf.latAvg === null ? latency : perf.latAvg + (latency - perf.latAvg) / perf.ttftN
+              perf.ttftLast = ttft
+              perf.ttftAvg = perf.ttftAvg === null ? ttft : perf.ttftAvg + (ttft - perf.ttftAvg) / perf.ttftN
+              if (tps !== null) {
+                perf.tpsLast = tps
+                perf.tpsAvg = perf.tpsAvg === null ? tps : perf.tpsAvg + (tps - perf.tpsAvg) / perf.ttftN
+              }
+              perf.hasPerf = true
             }
           }
         }
@@ -785,8 +892,10 @@ function TokenCachePanel(props: {
         hasDistData = dist.system + dist.user + dist.agent + dist.toolCall + dist.toolResult > 0 || dist.apiOutput > 0 || dist.apiInput > 0 || dist.reasoning > 0
       } catch {}
       const finalDist = hasDistData ? dist : lastDist(), finalHasDist = hasDistData || lastHasDist()
+      // 性能快照回退与 dist 同策略（lastPerf 读取在 untrack 内，避免响应式依赖成环）
+      const finalPerf = perf.hasPerf ? perf : lastPerf(), finalHasPerf = perf.hasPerf || lastHasPerf()
       const skills = [...loadedSkills.values()]
-      return { finalDist, finalHasDist, skills }
+      return { finalDist, finalHasDist, finalPerf, finalHasPerf, skills }
     })
 
     setDataSignal({
@@ -795,6 +904,7 @@ function TokenCachePanel(props: {
       hasData: read > 0 || write > 0 || input > 0 || output > 0 || cost > 0,
       trend, hasTrendData, providerName, sessionHitRate,
       dist: distData.finalDist, hasDistData: distData.finalHasDist,
+      perf: distData.finalPerf, hasPerf: distData.finalHasPerf,
       skills: distData.skills, hasSkills: distData.skills.length > 0,
     })
   })
@@ -814,6 +924,11 @@ function TokenCachePanel(props: {
       setLastHasDist(true)
       // Also persist across component remounts (view switches)
       try { props.api.kv.set(`${KV_PREFIX}.dist_snapshot`, { ...d.dist }) } catch {}
+    }
+    if (d.hasPerf) {
+      setLastPerf({ ...d.perf })
+      setLastHasPerf(true)
+      try { props.api.kv.set(`${KV_PREFIX}.perf_snapshot`, { ...d.perf }) } catch {}
     }
   })
 
@@ -838,6 +953,7 @@ function TokenCachePanel(props: {
       setModelOpen(Boolean(props.api.kv.get(`${KV_PREFIX}.model`, true)))
       setDistOpen(Boolean(props.api.kv.get(`${KV_PREFIX}.dist`, false)))
       setSkillsOpen(Boolean(props.api.kv.get(`${KV_PREFIX}.skills`, true)))
+      setPerfOpen(Boolean(props.api.kv.get(`${KV_PREFIX}.perf`, true)))
       setBalanceOpen(Boolean(props.api.kv.get(`${KV_PREFIX}.balance.open`, false)))
     } catch {}
 
@@ -874,6 +990,7 @@ function TokenCachePanel(props: {
         setSectionModel(Boolean(props.api.kv.get(`${KV_PREFIX}.section.model`, true)))
         setSectionDist(Boolean(props.api.kv.get(`${KV_PREFIX}.section.dist`, true)))
         setSectionSkills(Boolean(props.api.kv.get(`${KV_PREFIX}.section.skills`, true)))
+        setSectionPerf(Boolean(props.api.kv.get(`${KV_PREFIX}.section.perf`, true)))
         setSectionBalance(Boolean(props.api.kv.get(`${KV_PREFIX}.section.balance`, true)))
         const bv = props.api.kv.get<boolean>(`${KV_PREFIX}.border`, true)
         setBorderVisible(bv !== false)
@@ -883,6 +1000,11 @@ function TokenCachePanel(props: {
         if (cachedDist) {
           setLastDist(cachedDist)
           setLastHasDist(true)
+        }
+        const cachedPerf = props.api.kv.get<PerfStats>(`${KV_PREFIX}.perf_snapshot`)
+        if (cachedPerf) {
+          setLastPerf({ ...EMPTY_PERF, ...cachedPerf })
+          setLastHasPerf(true)
         }
       } catch {
         // kv read failed — signals stay at defaults
@@ -987,6 +1109,39 @@ function TokenCachePanel(props: {
     const gap = Math.max(1, gauge - used)
     return label + " ".repeat(gap) + value + (unit ? " " + unit : "")
   }
+
+  // ── performance section rows ──
+  // 每行 "标签: 最近值 (均 均值)"；面板过窄放不下均值段时自动省略，
+  // 保证标签与最近值始终完整显示。
+  const perfRows = createMemo<string[]>(() => {
+    const p = data().perf
+    if (!p.hasPerf) return []
+    const gauge = panelWidth() - gutter()
+    const row = (label: string, lastStr: string, avgStr: string | null): string => {
+      let value = lastStr
+      if (avgStr) {
+        const suffix = " (" + avgStr + ")"
+        if (visualWidth(label) + visualWidth(lastStr + suffix) + 1 <= gauge) {
+          value = lastStr + suffix
+        }
+      }
+      return justify(label, value)
+    }
+    const rows: string[] = []
+    if (p.ttftLast !== null) {
+      rows.push(row(t("perfTTFT"), fmtMs(p.ttftLast),
+        p.ttftAvg !== null ? t("perfAvg", { v: fmtMs(p.ttftAvg) }) : null))
+    }
+    if (p.tpsLast !== null) {
+      rows.push(row(t("perfTPS"), p.tpsLast.toFixed(1) + " " + t("tokS"),
+        p.tpsAvg !== null ? t("perfAvg", { v: p.tpsAvg.toFixed(1) }) : null))
+    }
+    if (p.latLast !== null) {
+      rows.push(row(t("perfLat"), fmtMs(p.latLast),
+        p.latAvg !== null ? t("perfAvg", { v: fmtMs(p.latAvg) }) : null))
+    }
+    return rows
+  })
 
   const balanceHeader = () => {
     const arrow = balanceDetails().length > 0 ? (balanceOpen() ? "\u25bc " : "\u25b6 ") : ""
@@ -1121,6 +1276,22 @@ function TokenCachePanel(props: {
                 <span>{" ".repeat(Math.max(1, panelWidth() - gutter() - visualWidth(t("saved")) - visualWidth("~" + fmtCost(data().saved, currencySymbol(), exchangeRate()))))}</span>
                 <span style={{ fg: pal().success }}>~{fmtCost(data().saved, currencySymbol(), exchangeRate())}</span>
               </text>
+            </Show>
+          </Show>
+          </Show>
+
+          {/* ── performance: TTFT / TPS / latency (collapsible, default open) ── */}
+          <Show when={sectionPerf()}>
+          <Show when={data().hasPerf}>
+            {<text onMouseUp={() => setPerfOpen((o) => { const n = !o; persistFold("perf", n); return n })}>
+              <span style={{ fg: pal().muted }}>{perfOpen() ? "\u25bc " : "\u25b6 "}</span>
+              <span style={{ fg: pal().primary }}><b>{t("secPerf")}</b></span>
+              <span style={{ fg: pal().muted }}>{sep().slice(visualWidth((perfOpen() ? "\u25bc " : "\u25b6 ") + t("secPerf")))}</span>
+            </text>}
+            <Show when={perfOpen()}>
+              <For each={perfRows()}>
+                {(row) => <text fg={pal().muted}>{row}</text>}
+              </For>
             </Show>
           </Show>
           </Show>
@@ -1331,9 +1502,9 @@ function keyShortcut(api: TuiPluginApi, command: string, fallback: string): stri
 }
 
 /**
- * 输入框 hint 行（session_prompt slot 的 hint）：单行显示 路径 · 命中率 · 余额 · Tokens。
+ * 输入框 hint 行（session_prompt slot 的 hint）：单行显示 路径 · 命中率 · TPS。
  * 通过 ui.Prompt 的 hint prop 注入——宿主右侧的 token/commands 提示自动保留，
- * 三合一信息与路径同行显示在中间位置。
+ * 统计信息与路径同行显示在中间位置。
  */
 function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sessionId: string }): JSX.Element {
   const KV_PREFIX = "cache_panel"
@@ -1341,28 +1512,11 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
 
   const sid = props.sessionId
 
-  // ── 命中率（单条口径：最后一条有 token 的 assistant 消息）+ token 汇总 ──
+  // ── 命中率（单条口径：最后两条有 token 的 assistant 消息）──
   const stats = createMemo(() => {
     const id = sid
     if (!id) return null
     const msgs = props.api.state.session.messages(id) as Message[]
-    const session = typeof props.api.state.session.get === "function"
-      ? props.api.state.session.get(id)
-      : undefined
-    let input = session?.tokens?.input ?? 0
-    let read = session?.tokens?.cache?.read ?? 0
-    let write = session?.tokens?.cache?.write ?? 0
-    // 旧 SDK 无 session 聚合字段 → 遍历消息累加（与侧边栏 fallback 一致）
-    if (session?.tokens == null) {
-      for (const m of msgs) {
-        if (m.role !== "assistant") continue
-        const tk = (m as AssistantMessage).tokens
-        if (!tk) continue
-        input += num(tk.input)
-        read += num(tk.cache?.read)
-        write += num(tk.cache?.write)
-      }
-    }
     // 从后往前取最后两条有 token 数据的 assistant 消息 → 单条命中率 + 趋势
     // 分母含缓存写（业界口径：read / (input+read+write)）
     let hitRate = -1, prevHitRate = -1
@@ -1379,7 +1533,38 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
       prevHitRate = rate
       break
     }
-    return { hitRate, prevHitRate, input, read, write }
+    return { hitRate, prevHitRate }
+  })
+
+  // ── 最近一次 TPS（与侧边栏「性能」同口径）──
+  // 从后往前找最近一条已完成且无错误的 assistant 消息，用其最早内容 part
+  // 时间戳计算输出速度；流式中 / 无 part 数据的消息跳过。
+  const lastTps = createMemo(() => {
+    const id = sid
+    if (!id) return null
+    const msgs = props.api.state.session.messages(id) as Message[]
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]
+      if (m.role !== "assistant") continue
+      const am = m as AssistantMessage
+      const created = am.time?.created
+      const completed = am.time?.completed
+      const output = num(am.tokens?.output)
+      if (!created || !completed || am.error || output <= 0) continue
+      let firstStart: number | undefined
+      let parts: readonly Part[] = []
+      try { parts = props.api.state.part(am.id) } catch {}
+      for (const p of parts) {
+        if (p.type !== "text" && p.type !== "reasoning") continue
+        const st = p.time?.start
+        if (typeof st === "number" && st > 0 && (firstStart === undefined || st < firstStart)) firstStart = st
+      }
+      if (firstStart === undefined) continue
+      const genMs = completed - firstStart
+      if (genMs <= 0) continue
+      return (output / genMs) * 1000
+    }
+    return null
   })
 
   // 余额查询状态为共享信号（PanelSignals.balanceState），由 tui() 统一轮询
@@ -1440,14 +1625,6 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
     return Math.abs(d) < 0.05 ? null : d
   })
 
-  const balanceText = createMemo(() => {
-    const s = props.signals.balanceState()
-    if (s.status === "ok" && s.data) return formatBalanceText(s.data, props.signals.balanceCurrency(), props.signals.exchangeRate())
-    if (s.status === "loading") return "\u2026"
-    if (s.status === "error") return "\u26a0"
-    return "-"
-  })
-
   // 路径显示（替换宿主默认 hint 左侧的 cwd 文本）
   const directory = createMemo(() => {
     try { return props.api.state.path.directory } catch { return "" }
@@ -1477,6 +1654,7 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
   })
 
   // 统计部分分段（单一数据源）：量宽拼接 text，渲染逐段着色，避免双源漂移
+  // 内容：命中率(+趋势) · TPS；无有效 TPS 样本时整段隐藏
   const statsSegs = createMemo<{ text: string; color: string | undefined }[]>(() => {
     const s = stats()
     const hr = s && s.hitRate >= 0 ? (Math.floor(s.hitRate * 10) / 10).toFixed(1) + "%" : "--"
@@ -1488,11 +1666,10 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
     if (tr !== null) {
       segs.push({ text: " " + (tr > 0 ? "\u2191" : "\u2193") + Math.abs(tr).toFixed(1) + "%", color: tr > 0 ? pal().success : pal().error })
     }
-    segs.push({ text: " \u00b7 " + t("barTok") + " ", color: pal().muted })
-    segs.push({ text: s ? fmtCompact(s.input + s.read + s.write) : "--", color: pal().text })
-    if (!props.signals.balanceUnsupported()) {
-      segs.push({ text: " \u00b7 " + t("barBal") + " ", color: pal().muted })
-      segs.push({ text: balanceText(), color: pal().text })
+    const tps = lastTps()
+    if (tps !== null) {
+      segs.push({ text: " \u00b7 " + t("barTPS") + " ", color: pal().muted })
+      segs.push({ text: tps.toFixed(1) + " " + t("tokS"), color: pal().text })
     }
     segs.push({ text: " \u00b7 ", color: pal().muted })
     return segs
@@ -1625,6 +1802,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const [sectionModel, setSectionModel] = createSignal(true)
   const [sectionDist, setSectionDist] = createSignal(true)
   const [sectionSkills, setSectionSkills] = createSignal(true)
+  const [sectionPerf, setSectionPerf] = createSignal(true)
   const [sectionBalance, setSectionBalance] = createSignal(true)
   const [sectionBottom, setSectionBottom] = createSignal(true)
   const [balanceRefresh, setBalanceRefresh] = createSignal(0)
@@ -1654,6 +1832,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     sectionModel, setSectionModel,
     sectionDist, setSectionDist,
     sectionSkills, setSectionSkills,
+    sectionPerf, setSectionPerf,
     sectionBalance, setSectionBalance,
     sectionBottom, setSectionBottom,
     balanceRefresh, setBalanceRefresh,
@@ -1881,6 +2060,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         const modelOn  = Boolean(api.kv.get(`${KV_PREFIX}.section.model`, true))
         const distOn   = Boolean(api.kv.get(`${KV_PREFIX}.section.dist`, true))
         const skillsOn = Boolean(api.kv.get(`${KV_PREFIX}.section.skills`, true))
+        const perfOn   = Boolean(api.kv.get(`${KV_PREFIX}.section.perf`, true))
         const balanceOn = Boolean(api.kv.get(`${KV_PREFIX}.section.balance`, true))
         const bottomOn = Boolean(api.kv.get(`${KV_PREFIX}.section.bottom`, true))
         const borderOn = Boolean(api.kv.get(`${KV_PREFIX}.border`, true))
@@ -1889,6 +2069,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           model:   t("secModel"),
           dist:    t("distTitle"),
           skills:  t("secSkills"),
+          perf:    t("secPerf"),
           balance: t("secBalance"),
           bottom:  t("secBottom"),
           border:  t("secBorder"),
@@ -1902,6 +2083,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
               { title: optTitle(labels.model, modelOn),     value: "model" },
               { title: optTitle(labels.dist, distOn),       value: "dist" },
               { title: optTitle(labels.skills, skillsOn),   value: "skills" },
+              { title: optTitle(labels.perf, perfOn),       value: "perf" },
               { title: optTitle(labels.balance, balanceOn), value: "balance" },
               { title: optTitle(labels.bottom, bottomOn),   value: "bottom" },
               { title: optTitle(labels.border, borderOn),   value: "border" },
@@ -1920,6 +2102,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
                 if (opt.value === "model")  signals.setSectionModel(!cur)
                 if (opt.value === "dist")   signals.setSectionDist(!cur)
                 if (opt.value === "skills") signals.setSectionSkills(!cur)
+                if (opt.value === "perf")   signals.setSectionPerf(!cur)
                 if (opt.value === "balance") signals.setSectionBalance(!cur)
                 if (opt.value === "bottom")  signals.setSectionBottom(!cur)
                 const name = labels[opt.value] ?? opt.value
@@ -1944,6 +2127,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         const model = Boolean(api.kv.get(`${KV_PREFIX}.section.model`, true))
         const dist = Boolean(api.kv.get(`${KV_PREFIX}.section.dist`, true))
         const skills = Boolean(api.kv.get(`${KV_PREFIX}.section.skills`, true))
+        const perf = Boolean(api.kv.get(`${KV_PREFIX}.section.perf`, true))
         const balance = Boolean(api.kv.get(`${KV_PREFIX}.section.balance`, true))
         const bottom = Boolean(api.kv.get(`${KV_PREFIX}.section.bottom`, true))
         const on = (v: boolean) => v ? "ON" : "OFF"
@@ -1952,7 +2136,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           message: t("panelConfigMsg", {
             c: sym, r: rate,
             d: on(detail), m: on(model),
-            t: on(dist), k: on(skills),
+            t: on(dist), k: on(skills), p: on(perf),
             b: on(balance), f: on(bottom),
           }),
           duration: 8000,
