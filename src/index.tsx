@@ -13,17 +13,13 @@ import type {
   SequenceBindingLike,
 } from "@opencode-ai/plugin/tui"
 import type { UserMessage, AssistantMessage, Message } from "@opencode-ai/sdk"
-import type {
-  Part,
-  TextPart,
-  ToolPart,
-  FilePart,
-  ReasoningPart,
-} from "@opencode-ai/sdk/v2"
+import type { Part, ToolPart } from "@opencode-ai/sdk/v2"
 import { createMemo, createSignal, createEffect, onMount, onCleanup, Show, For, untrack } from "solid-js"
 import { PLUGIN_VERSION } from "./_version"
 import { balanceProviders, getBalanceProvider, maskKey, matchBalanceProvider, type BalanceDetail, type BalanceDetailKey, type BalanceEntry, type BalanceProvider } from "./balance-providers"
 import { LANG_META, createT, detectLang, type LangCode, type Translation } from "./i18n"
+import { num, estimateTokens } from "./tokens"
+import { computePerfSample, computeLivePerf, type LivePerf } from "./perf"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,6 +30,9 @@ declare const process: {
   env: Record<string, string | undefined>
   getBuiltinModule?: (id: string) => unknown
 } | undefined
+
+// KV 存储键前缀（单一来源，避免各组件间键名漂移）
+const KV_PREFIX = "cache_panel"
 
 // ── terminal-width helpers ────────────────────────────────────────
 // CJK characters occupy 2 terminal columns; padEnd/padStart count
@@ -212,10 +211,6 @@ function fmt(n: number): string {
   return n.toLocaleString("en-US")
 }
 
-function num(v: unknown): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : 0
-}
-
 function fmtCost(n: number, symbol = "$", rate = 1): string {
   const v = n * rate
   if (v >= 1) return symbol + v.toFixed(2)
@@ -227,43 +222,6 @@ function fmtCost(n: number, symbol = "$", rate = 1): string {
 function fmtMs(ms: number): string {
   if (ms < 1000) return Math.round(ms) + "ms"
   return (ms / 1000).toFixed(1) + "s"
-}
-
-// ── token estimation ──
-// Character-based BPE approximation.  Default ratios (~4 ASCII or ~1.5 CJK
-// chars per token) work well for natural language but systematically
-// under-count tokens in JSON and source code where every punctuation mark
-// tends to be its own token.  Detect these cases and tighten the ratio.
-// See: GPT-4 / Claude tokenizer behaviour with structured text.
-
-function estimateTokens(text: string): number {
-  if (!text || text.length === 0) return 0
-  let ascii = 0
-  let cjk = 0
-  for (const c of text) {
-    const code = c.codePointAt(0) ?? 0
-    if (code >= 0x4E00 && code <= 0x9FFF) cjk++       // CJK Unified
-    else if (code >= 0x3040 && code <= 0x30FF) cjk++   // Hiragana/Katakana
-    else if (code >= 0xAC00 && code <= 0xD7A3) cjk++   // Hangul
-    else if (code >= 0x1100 && code <= 0x11FF) cjk++   // Hangul Jamo
-    else if (code >= 0x2E80 && code <= 0x2EFF) cjk++   // CJK Radicals
-    else ascii++
-  }
-
-  // Real BPE tokenizers (cl100k_base, o200k_base) average ~3.5-4.0
-  // ASCII chars/token for both JSON and source code — close to prose.
-  // The old 2.0 / 2.5 ratios matched minified-JS extremes, not typical
-  // payloads, and systematically over-estimated token counts.
-  const trimmed = text.trimStart()
-  // Strip markdown code-fence prefix so that ```json … is detected as JSON
-  const strippedFence = trimmed.replace(/^\x60{3}\w*\s*\n?/, "")
-  const jsonLike = (strippedFence.startsWith("{") || strippedFence.startsWith("["))
-    && /"[^"]+"\s*:/.test(text)
-  const codeLike = !jsonLike
-    && /```|^import |^export |^function |^const |^let |^var |^class |^interface |^type |^def |^fn |^pub |^use |^mod |^package /m.test(text)
-
-  const asciiPerToken = jsonLike ? 3.5 : codeLike ? 3.5 : 4
-  return Math.max(1, Math.ceil(ascii / asciiPerToken + cjk / 1.0))
 }
 
 interface TokenDist {
@@ -280,23 +238,9 @@ interface TokenDist {
   stepCount: number // step-finish parts count across the current round (parentID chain)
 }
 
-// ── performance (TTFT / TPS / latency) ──
-// 在 opencode-throughput / opencode-tokenwatch 口径基础上的修正版：
-//   TTFT   = 首个内容 part (text/reasoning) 的 time.start − message.time.created
-//            （体感口径：含 DB 写、工具注册解析、git 快照、HTTP 建连与重试等待等
-//             本地预处理开销，略大于 provider 报告的 TTFT）
-//   净生成 = time.completed − 首个 part start − 工具执行窗口∩生成区间
-//   TPS    = output tokens / 净生成 × 1000
-//   延迟   = time.completed − time.created − 工具执行窗口∩生成区间（净模型耗时）
-// 修正点（与 throughput/tokenwatch 的差异）：
-//   1. 取最早的 part 时间而非最后一个，避免把后续 part 误当首个而高估 TTFT（tokenwatch）
-//   2. opencode 的 time.completed 在流 drain 完（含工具执行产出 tool-result）后才写入，
-//      故按 tool part 的 state.time.start/end（区间合并去重）扣除工具等待，
-//      工具密集的 step 不再拉低 TPS / 拉高延迟；首内容前的服务端工具时间计入 TTFT
-//   3. 压缩（summary）消息与纯工具 step（无内容 part）不计入样本，三个指标样本集一致
-//   4. 非流式/缓冲网关（生成窗口 <30ms 或 <0.2ms/token）时 TPS 记 null 而非输出虚高值
-// 状态驱动：消息与 part 的时间戳持久化在数据库中，直接响应式推导——
-// 历史会话与子代理会话自动生效，无需事件监听、缓存或文件日志。
+// ── performance stats ──
+// TTFT/TPS/latency 的采样口径与实时估算实现见 ./perf.ts（computePerfSample /
+// computeLivePerf 唯一实现），此处仅定义侧边栏/hint 栏展示用的聚合形状。
 interface PerfStats {
   ttftLast: number | null // 最近一次首字延迟 (ms)
   tpsLast: number | null  // 最近一次输出速度 (tok/s)
@@ -304,14 +248,78 @@ interface PerfStats {
   ttftAvg: number | null  // 会话平均首字延迟 (ms)
   tpsAvg: number | null   // 会话平均输出速度 (tok/s)
   latAvg: number | null   // 会话平均净模型延迟 (ms)
-  ttftN: number           // 有效样本数（TTFT/TPS/延迟共用；压缩消息与纯工具 step 不计）
+  ttftN: number           // 有效样本数（TTFT/延迟共用；压缩消息与纯工具 step 不计）
+  tpsN: number            // TPS 有效样本数（缓冲网关守卫记 null 的样本不计入）
   hasPerf: boolean        // 是否存在有效样本
 }
 
 const EMPTY_PERF: PerfStats = {
   ttftLast: null, tpsLast: null, latLast: null,
   ttftAvg: null, tpsAvg: null, latAvg: null,
-  ttftN: 0, hasPerf: false,
+  ttftN: 0, tpsN: 0, hasPerf: false,
+}
+
+// 流式活跃期间的 250ms 心跳：part 事件只随 delta 到达，长时间无增量（深度思考、
+// 缓冲网关、step 间隙）时由心跳推动时钟前进；空闲时 interval 不存在，零常驻开销。
+// api.state 是宿主暴露的响应式 Solid store（adapters.tsx 直接透传 sync.data，
+// createStore 实现）：活跃判定优先读 session.status（busy 覆盖工具执行、
+// step 间 gap、下一步 prefill 全程——与 computeLivePerf 的工具回合延续窗口
+// 对齐，仅读消息状态会在"上一步 completed → 下一条未创建"的间隙停摆）；
+// status API 不可用时回退到消息判定（最后一条 assistant 未完成）。
+// 返回 signal getter——在 memo 中读取它以建立 250ms 重算依赖。
+function createBusyTick(api: TuiPluginApi, sid: () => string): () => number {
+  const [tick, setTick] = createSignal(0)
+  createEffect(() => {
+    let active = false
+    try {
+      const st = api.state.session.status?.(sid()) as { type?: string } | undefined
+      if (st) active = st.type === "busy"
+      else {
+        const msgs = api.state.session.messages(sid())
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role !== "assistant") continue
+          const am = msgs[i] as AssistantMessage
+          active = !am.time?.completed && !am.error && !am.summary
+          break
+        }
+      }
+    } catch {}
+    if (!active) return
+    const timer = setInterval(() => setTick((v) => v + 1), 250)
+    onCleanup(() => clearInterval(timer))
+  })
+  return tick
+}
+
+type StatSeg = { text: string; color: string | undefined }
+type Translate = ReturnType<typeof createT>
+
+// 流式实时估算的着色分段（PromptRightStatus 输入框行右侧实时显示专用；
+// 侧边栏「性能」区为纯精确口径，无实时行）：
+// prefill → 首字 等待中；streaming → 首字(精确) · 速度(≈，守卫未达则省略)；
+// tool → 工具 计时中（速度段隐藏）。
+function liveStatSegs(lv: LivePerf, t: Translate, muted: string | undefined, text: string | undefined): StatSeg[] {
+  if (lv.phase === "tool") {
+    return [
+      { text: t("barTool") + " ", color: muted },
+      { text: fmtMs(lv.toolMs) + "\u2026", color: text },
+    ]
+  }
+  if (lv.phase === "prefill") {
+    return [
+      { text: t("barTTFT") + " ", color: muted },
+      { text: fmtMs(lv.waitMs) + "\u2026", color: text },
+    ]
+  }
+  const segs: StatSeg[] = [
+    { text: t("barTTFT") + " ", color: muted },
+    { text: fmtMs(lv.ttft), color: text },
+  ]
+  if (lv.tps !== null) {
+    segs.push({ text: " \u00b7 " + t("barTPS") + " ", color: muted })
+    segs.push({ text: "\u2248" + lv.tps.toFixed(1) + " " + t("tokS"), color: text })
+  }
+  return segs
 }
 
 // ---------------------------------------------------------------------------
@@ -771,19 +779,9 @@ function TokenCachePanel(props: {
             dist.output += num(am.tokens?.output)
             dist.reasoning += num(am.tokens?.reasoning)
             let parts: readonly Part[] = []; try { parts = props.api.state.part(msg.id) } catch {}
-            // 首个内容 part (text/reasoning) 的开始时间 = 首 token 到达时刻；
-            // 取最早值（tokenwatch 修正：避免把后续 part 误当首个而高估 TTFT）
-            let firstStart: number | undefined
-            // 工具执行窗口 [start, end] 列表（仅 completed/error 有完整时间）
-            let toolIvs: [number, number][] | null = null
             for (const p of parts) {
               if (p.type === "tool") {
                 const tp = p as any; let rawInput = ""
-                const tw = tp.state?.time
-                if (typeof tw?.start === "number" && tw.start > 0 && typeof tw.end === "number" && tw.end > tw.start) {
-                  toolIvs ??= []
-                  toolIvs.push([tw.start, tw.end])
-                }
                 try { rawInput = tp.state.raw ?? (tp.state.input != null ? JSON.stringify(tp.state.input) : "") } catch {}
                 if (rawInput) dist.toolCall += estimateTokens(rawInput)
                 // 子代理委托（task 工具）：任务描述计入子代理指令（1.15.x 无 subtask part）
@@ -813,48 +811,20 @@ function TokenCachePanel(props: {
                     }
                   }
                 }
-              } else if (p.type === "subtask") { const sub = p as any; dist.agent += estimateTokens(sub.prompt || sub.description || "") }
-              else if (p.type === "text" || p.type === "reasoning") {
-                const st = p.time?.start
-                if (typeof st === "number" && st > 0 && (firstStart === undefined || st < firstStart)) firstStart = st
-              }
+            } else if (p.type === "subtask") { const sub = p as any; dist.agent += estimateTokens(sub.prompt || sub.description || "") }
             }
-            // 已完成、无错误、非压缩、且有内容 part 的请求 → 计入性能样本
-            // （流式中 / 失败 / 零输出 / 压缩 summary / 纯工具 step 不计，三个指标样本集一致）
-            const created = am.time?.created
-            const completed = am.time?.completed
-            const outputTok = num(am.tokens?.output)
-            if (created && completed && !am.error && !am.summary && outputTok > 0
-              && firstStart !== undefined && firstStart > created) {
-              const fs = firstStart
-              // 合并工具执行窗口（并行工具区间重叠），扣除与生成区间的交集
-              let toolMs = 0
-              if (toolIvs) {
-                toolIvs.sort((a, b) => a[0] - b[0])
-                let ms = 0, ws = -1, we = -1
-                for (const [s, e] of toolIvs) {
-                  const lo = Math.max(s, fs), hi = Math.min(e, completed)
-                  if (hi <= lo) continue
-                  if (ws < 0) { ws = lo; we = hi }
-                  else if (lo <= we) { if (hi > we) we = hi }
-                  else { ms += we - ws; ws = lo; we = hi }
-                }
-                if (ws >= 0) ms += we - ws
-                toolMs = ms
-              }
-              const ttft = fs - created
-              const genMs = Math.max(0, completed - fs - toolMs)
-              const latency = Math.max(0, completed - created - toolMs)
-              // 非流式/缓冲网关守卫：生成窗口 <30ms 或 <0.2ms/token 时不可信 → TPS 记 null
-              const tps = genMs >= Math.max(30, outputTok / 5) ? (outputTok / genMs) * 1000 : null
+            // 性能样本：computePerfSample 唯一实现（hint 栏 lastTps 共用，防双源漂移）
+            const sample = computePerfSample(am, parts)
+            if (sample) {
               perf.ttftN++
-              perf.latLast = latency
-              perf.latAvg = perf.latAvg === null ? latency : perf.latAvg + (latency - perf.latAvg) / perf.ttftN
-              perf.ttftLast = ttft
-              perf.ttftAvg = perf.ttftAvg === null ? ttft : perf.ttftAvg + (ttft - perf.ttftAvg) / perf.ttftN
-              if (tps !== null) {
-                perf.tpsLast = tps
-                perf.tpsAvg = perf.tpsAvg === null ? tps : perf.tpsAvg + (tps - perf.tpsAvg) / perf.ttftN
+              perf.latLast = sample.latency
+              perf.latAvg = perf.latAvg === null ? sample.latency : perf.latAvg + (sample.latency - perf.latAvg) / perf.ttftN
+              perf.ttftLast = sample.ttft
+              perf.ttftAvg = perf.ttftAvg === null ? sample.ttft : perf.ttftAvg + (sample.ttft - perf.ttftAvg) / perf.ttftN
+              if (sample.tps !== null) {
+                perf.tpsN++
+                perf.tpsLast = sample.tps
+                perf.tpsAvg = perf.tpsAvg === null ? sample.tps : perf.tpsAvg + (sample.tps - perf.tpsAvg) / perf.tpsN
               }
               perf.hasPerf = true
             }
@@ -936,7 +906,6 @@ function TokenCachePanel(props: {
   const [partVersion, setPartVersion] = createSignal(0)
 
   // Persist fold state to api.kv
-  const KV_PREFIX = "cache_panel"
   const persistFold = (key: string, val: boolean) => {
     try { props.api.kv.set(`${KV_PREFIX}.${key}`, val) } catch {}
   }
@@ -1111,35 +1080,43 @@ function TokenCachePanel(props: {
   }
 
   // ── performance section rows ──
-  // 每行 "标签: 最近值 (均 均值)"；面板过窄放不下均值段时自动省略，
+  // 每行 "标签: 最近值 (均 均值)"，仅精确口径（请求结束后随精确数据刷新，
+  // 与面板其他数据行为统一）；面板过窄放不下均值段时自动省略，
   // 保证标签与最近值始终完整显示。
+  const perfRow = (label: string, lastStr: string, avgStr: string | null): string => {
+    const gauge = panelWidth() - gutter()
+    let value = lastStr
+    if (avgStr) {
+      const suffix = " (" + avgStr + ")"
+      if (visualWidth(label) + visualWidth(lastStr + suffix) + 1 <= gauge) {
+        value = lastStr + suffix
+      }
+    }
+    return justify(label, value)
+  }
+
+  // 延迟行：单次请求完成后才有值
+  const latRow = createMemo<string | null>(() => {
+    const p = data().perf
+    if (p.latLast === null) return null
+    return perfRow(t("perfLat"), fmtMs(p.latLast),
+      p.latAvg !== null ? t("perfAvg", { v: fmtMs(p.latAvg) }) : null)
+  })
+
   const perfRows = createMemo<string[]>(() => {
     const p = data().perf
     if (!p.hasPerf) return []
-    const gauge = panelWidth() - gutter()
-    const row = (label: string, lastStr: string, avgStr: string | null): string => {
-      let value = lastStr
-      if (avgStr) {
-        const suffix = " (" + avgStr + ")"
-        if (visualWidth(label) + visualWidth(lastStr + suffix) + 1 <= gauge) {
-          value = lastStr + suffix
-        }
-      }
-      return justify(label, value)
-    }
     const rows: string[] = []
     if (p.ttftLast !== null) {
-      rows.push(row(t("perfTTFT"), fmtMs(p.ttftLast),
+      rows.push(perfRow(t("perfTTFT"), fmtMs(p.ttftLast),
         p.ttftAvg !== null ? t("perfAvg", { v: fmtMs(p.ttftAvg) }) : null))
     }
     if (p.tpsLast !== null) {
-      rows.push(row(t("perfTPS"), p.tpsLast.toFixed(1) + " " + t("tokS"),
+      rows.push(perfRow(t("perfTPS"), p.tpsLast.toFixed(1) + " " + t("tokS"),
         p.tpsAvg !== null ? t("perfAvg", { v: p.tpsAvg.toFixed(1) }) : null))
     }
-    if (p.latLast !== null) {
-      rows.push(row(t("perfLat"), fmtMs(p.latLast),
-        p.latAvg !== null ? t("perfAvg", { v: fmtMs(p.latAvg) }) : null))
-    }
+    const lr = latRow()
+    if (lr) rows.push(lr)
     return rows
   })
 
@@ -1507,7 +1484,6 @@ function keyShortcut(api: TuiPluginApi, command: string, fallback: string): stri
  * 统计信息与路径同行显示在中间位置。
  */
 function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sessionId: string }): JSX.Element {
-  const KV_PREFIX = "cache_panel"
   const t = createT(() => props.signals.langCode())
 
   const sid = props.sessionId
@@ -1536,9 +1512,10 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
     return { hitRate, prevHitRate }
   })
 
-  // ── 最近一次 TPS（与侧边栏「性能」同口径）──
-  // 从后往前找最近一条已完成且无错误的 assistant 消息，用其最早内容 part
-  // 时间戳计算输出速度；流式中 / 无 part 数据的消息跳过。
+  // ── 最近一次 TPS（与侧边栏「性能」严格同源）──
+  // 从后往前找最近一条能产出有效性能样本的 assistant 消息，取其 TPS。
+  // 采样逻辑走 computePerfSample 唯一实现（含 output+reasoning 分子、
+  // 工具区间扣除与缓冲网关守卫）；样本 TPS 为 null（缓冲网关）或无样本 → null。
   const lastTps = createMemo(() => {
     const id = sid
     if (!id) return null
@@ -1547,22 +1524,10 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
       const m = msgs[i]
       if (m.role !== "assistant") continue
       const am = m as AssistantMessage
-      const created = am.time?.created
-      const completed = am.time?.completed
-      const output = num(am.tokens?.output)
-      if (!created || !completed || am.error || output <= 0) continue
-      let firstStart: number | undefined
       let parts: readonly Part[] = []
       try { parts = props.api.state.part(am.id) } catch {}
-      for (const p of parts) {
-        if (p.type !== "text" && p.type !== "reasoning") continue
-        const st = p.time?.start
-        if (typeof st === "number" && st > 0 && (firstStart === undefined || st < firstStart)) firstStart = st
-      }
-      if (firstStart === undefined) continue
-      const genMs = completed - firstStart
-      if (genMs <= 0) continue
-      return (output / genMs) * 1000
+      const s = computePerfSample(am, parts)
+      if (s && s.tps !== null) return s.tps
     }
     return null
   })
@@ -1653,8 +1618,10 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
     onCleanup(() => clearInterval(timer))
   })
 
-  // 统计部分分段（单一数据源）：量宽拼接 text，渲染逐段着色，避免双源漂移
-  // 内容：命中率(+趋势) · TPS；无有效 TPS 样本时整段隐藏
+  // 统计部分分段（单一数据源）：量宽拼接 text，渲染逐段着色，避免双源漂移。
+  // 仅精确口径（命中率 + 趋势 + TPS）：宿主 Prompt 在 busy 时把 hint 行整体
+  // 替换为忙碌指示行（Switch 分支，组件随之卸载），流式实时估算因此放在
+  // 输入框行右侧（PromptRightStatus，session_prompt_right 插槽）。
   const statsSegs = createMemo<{ text: string; color: string | undefined }[]>(() => {
     const s = stats()
     const hr = s && s.hitRate >= 0 ? (Math.floor(s.hitRate * 10) / 10).toFixed(1) + "%" : "--"
@@ -1671,6 +1638,7 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
       segs.push({ text: " \u00b7 " + t("barTPS") + " ", color: pal().muted })
       segs.push({ text: tps.toFixed(1) + " " + t("tokS"), color: pal().text })
     }
+    // 末尾分隔符：hint 会被宿主在同一行拼接 context/cost 文字（如 "129.6K (13%) · $0.41"）
     segs.push({ text: " \u00b7 ", color: pal().muted })
     return segs
   })
@@ -1682,6 +1650,10 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
 
   // 宿主右侧 usage 文本复刻（1.18.16 Prompt 口径）：
   // 最后一条 output>0 的 assistant 消息 → tokens 合计格式化 + 模型 context limit 百分比 + session 累计费用
+  // 注意：这里仅用于估算右侧占用宽度（路径截断），并非真实渲染。
+  // 硬编码了宿主格式（"129.6K (13%) · $0.41"）与快捷键文案（"ctrl+p commands"），
+  // opencode 升级若改动 Prompt 右侧渲染格式，需同步维护此复刻口径，否则路径截断宽度会漂移
+  // （有 truncateVisual 兜底，仅轻微错位、不会崩溃）。
   const sessionCost = createMemo(() => {
     try { return num(props.api.state.session.get(sid)?.cost) } catch { return 0 }
   })
@@ -1767,6 +1739,44 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
   )
 }
 
+/**
+ * 输入框行右侧（session_prompt_right 插槽）：流式期间显示实时 首字/速度。
+ * 宿主 Prompt 在会话 busy 时把底部 hint 行整体替换为忙碌指示行（Switch 分支，
+ * 该行无插槽可注入），而输入框行右侧不受 status 控制、流式期间仍挂载——
+ * 是 hint 之外唯一能实时显示的位置。空闲时回落为宿主 session_prompt_right
+ * 透传（oc-tps 等其他插件在该插槽的显示不受影响）。
+ */
+function PromptRightStatus(props: { api: TuiPluginApi; signals: PanelSignals; sessionId: string }): JSX.Element {
+  const sid = props.sessionId
+  const t = createT(() => props.signals.langCode())
+
+  const pal = createMemo(() => {
+    const th = props.api.theme.current as Record<string, unknown>
+    return {
+      muted: desaturateTo(th.textMuted, MAX_SAT, FALLBACK.muted),
+      text: desaturateTo(th.text, MAX_SAT, FALLBACK.text),
+    }
+  })
+
+  const liveTick = createBusyTick(props.api, () => sid)
+  const live = createMemo(() => {
+    liveTick()
+    return computeLivePerf(props.api, sid)
+  })
+
+  return (
+    <Show when={live()} fallback={<props.api.ui.Slot name="session_prompt_right" session_id={sid} />}>
+      {(lv) => (
+        <text wrapMode="none">
+          <For each={liveStatSegs(lv(), t, pal().muted, pal().text)}>
+            {(sg) => <span style={{ fg: sg.color }}>{sg.text}</span>}
+          </For>
+        </text>
+      )}
+    </Show>
+  )
+}
+
 function createSidebarSlot(api: TuiPluginApi, signals: PanelSignals): TuiSlotPlugin {
   let lastSlotSid = ""
   return {
@@ -1778,7 +1788,7 @@ function createSidebarSlot(api: TuiPluginApi, signals: PanelSignals): TuiSlotPlu
           lastSlotSid = input.session_id
           if (signals.overrideSessionId()) {
             signals.setOverrideSessionId(undefined)
-            api.kv.set("cache_panel.session", "")
+            api.kv.set(`${KV_PREFIX}.session`, "")
           }
         }
         return (
@@ -1850,7 +1860,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   // 输入框 hint 行（session_prompt slot，replace 模式）：
   // 用宿主同一 Prompt 组件重渲染输入框，仅替换 hint 行左侧——
-  // 在路径与右侧 token/commands 提示之间插入 命中率 · 余额 · Tokens。
+  // 在路径与右侧 token/commands 提示之间插入 命中率(+趋势) · TPS（精确口径）。
   api.slots.register({
     order: 55,
     slots: {
@@ -1874,7 +1884,9 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
             hint={<BottomStatusBar api={api} signals={signals} sessionId={input.session_id} />}
             // 接管 session_prompt 后需透传宿主的 session_prompt_right 插槽，
             // 否则 oc-tps 等依赖该插槽的插件无法显示；无注册时 Slot 为 null。
-            right={<api.ui.Slot name="session_prompt_right" session_id={input.session_id} />}
+            // 流式期间（busy）宿主把 hint 行替换为忙碌指示行，实时 首字/速度
+            // 改由输入框行右侧的 PromptRightStatus 显示，空闲时其内部透传宿主 Slot。
+            right={<PromptRightStatus api={api} signals={signals} sessionId={input.session_id} />}
           />
         )
       },
@@ -1882,7 +1894,6 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   })
 
   // ── slash commands for runtime config ──
-  const KV_PREFIX = "cache_panel"
 
   // ── 语言偏好恢复：KV 就绪后优先用户设置（/cache-lang），覆盖自动识别 ──
   const restoreLang = () => {
