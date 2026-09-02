@@ -14,22 +14,36 @@ Included metrics:
 
 ## Local Build
 
-Run `npm run build`, then copy `dist\tui.js` into the OpenCode plugin folder and rename it to `opencode-visual-cache.js`.
+Run `npm run build`, then copy `dist/tui.js` into `~/.config/opencode/plugins` and rename it to `opencode-visual-cache.js`.
 
 ```powershell
 npm run build; if ($?) { New-Item -ItemType Directory -Force "~\.config\opencode\plugins" | Out-Null; Copy-Item dist\tui.js "~\.config\opencode\plugins\opencode-visual-cache.js" -Force }
 ```
 
-Edit `tui.json`, then restart OpenCode.
+Edit `~/.config/opencode/tui.json` to add the local plugin.
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
+    // ...
     "./plugins/opencode-visual-cache.js"
   ]
 }
 ```
+
+Edit `~/.config/opencode/package.json` to add the dependency.
+
+```jsonc
+{
+  "dependencies": {
+    // ...
+    "@opentui/solid": "0.4.5"
+  }
+}
+```
+
+Restart OpenCode.
 
 ## License
 

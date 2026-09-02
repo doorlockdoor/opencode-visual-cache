@@ -14,22 +14,36 @@ Vibe自opencode-visual-cache，新增首字延迟（TTFT），生成速度（TPS
 
 ## 本地构建
 
-`npm run build`，然后复制`dist\tui.js`到opencode插件文件夹，重命名为`opencode-visual-cache.js`。
+`npm run build`，然后复制`dist/tui.js`到`~/.config/opencode/plugins`，重命名为`opencode-visual-cache.js`。
 
 ```powershell
 npm run build; if ($?) { New-Item -ItemType Directory -Force "~\.config\opencode\plugins" | Out-Null; Copy-Item dist\tui.js "~\.config\opencode\plugins\opencode-visual-cache.js" -Force }
 ```
 
-编辑`tui.json`，重启opencode。
+编辑`~/.config/opencode/tui.json`，添加本地插件。
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
+    // ...
     "./plugins/opencode-visual-cache.js"
   ]
 }
 ```
+
+编辑`~/.config/opencode/package.json`，添加依赖。
+
+```jsonc
+{
+  "dependencies": {
+    // ...
+    "@opentui/solid": "0.4.5"
+  }
+}
+```
+
+重启opencode。
 
 ## License
 
