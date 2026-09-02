@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { estimateTokens, num } from "../src/tokens"
-import { computePerfSample, computeLivePerf } from "../src/perf"
+import { computePerfSample, computeLivePerf, aggregatePerf } from "../src/perf"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { AssistantMessage, Message } from "@opencode-ai/sdk"
 import type { Part } from "@opencode-ai/sdk/v2"
@@ -9,7 +9,10 @@ import type { Part } from "@opencode-ai/sdk/v2"
 
 assert.equal(estimateTokens(""), 0)
 assert.equal(estimateTokens("hello"), 2) // 5 ASCII / 4 → ceil 2
-assert.equal(estimateTokens("你好"), 2) // 2 CJK → 2
+assert.equal(estimateTokens("你好"), 2) // 2 汉字 / 1.5 → ceil 2
+assert.equal(estimateTokens("你好世界"), 3) // 4 汉字 / 1.5 → ceil 3
+assert.equal(estimateTokens("你好abc"), 3) // 2 汉字/1.5 + 3 ASCII/4 → ceil 3
+assert.equal(estimateTokens("かな"), 2) // 假名按 1 字/token（与汉字区分）
 assert.equal(estimateTokens("{}"), 1) // 无 "key": 不判 JSON，按 prose 2/4 → 1
 assert.equal(estimateTokens('{"a":1}'), 2) // JSON：7 ASCII / 3.5 → 2
 assert.equal(estimateTokens("import x from 'y'"), 5) // code：17 ASCII / 3.5 → 5
@@ -103,6 +106,43 @@ assert.equal(computePerfSample(am({ error: { name: "UnknownError", data: { messa
 assert.equal(computePerfSample(am({ tokens: { input: 10, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }), [textPart(1500)]), null)
 assert.equal(computePerfSample(am(), [toolPart(2000, 3000)]), null) // 无内容 part
 assert.equal(computePerfSample(am(), [textPart(1000)]), null) // firstStart <= created
+
+// ── aggregatePerf（侧边栏聚合，perf.ts 单一来源）───────────────────────────
+
+// 两条有效样本 → 子集均值
+{
+  const m1 = am() // ttft 500 / tps 66.7 / lat 2000
+  const m2 = am({ id: "m2", time: { created: 5000, completed: 6000 }, tokens: { input: 5, output: 200, reasoning: 0, cache: { read: 0, write: 0 } } })
+  const api = makeApi({
+    messages: () => [],
+    parts: (mid) => (mid === "m1" ? [textPart(1500)] : mid === "m2" ? [textPart(5500)] : []),
+  })
+  const perf = aggregatePerf(api, [m1, m2] as unknown as Message[])
+  assert.equal(perf.ttftN, 2)
+  assert.equal(perf.ttftAvg, 500)
+  assert.equal(perf.tpsN, 2)
+  assert.ok(Math.abs(perf.tpsAvg! - (100 / 1.5 + 400) / 2) < 1e-9) // m2: 200 tok / 500ms
+  assert.equal(perf.tpsLast, 400)
+  assert.equal(perf.latLast, 1000)
+  assert.equal(perf.hasPerf, true)
+}
+
+// 压缩/纯工具不计入；缓冲网关守卫只剔除 tps，不稀释均值
+{
+  const valid = am()
+  const skipped = am({ id: "m2", summary: true })
+  const buffered = am({ id: "m3", time: { created: 1000, completed: 1005 }, tokens: { input: 1, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } })
+  const api = makeApi({
+    messages: () => [],
+    parts: (mid) => (mid === "m1" ? [textPart(1500)] : mid === "m3" ? [textPart(1001)] : []),
+  })
+  const perf = aggregatePerf(api, [valid, skipped, buffered] as unknown as Message[])
+  assert.equal(perf.ttftN, 2) // summary 不计；buffered 仍计 ttft/latency
+  assert.equal(perf.tpsN, 1) // buffered 的 tps 为 null，不计入
+  assert.ok(Math.abs(perf.tpsAvg! - 100 / 1.5) < 1e-9)
+  assert.equal(perf.ttftLast, 1)
+  assert.equal(perf.hasPerf, true)
+}
 
 // ── computeLivePerf helpers ────────────────────────────────────────────────
 

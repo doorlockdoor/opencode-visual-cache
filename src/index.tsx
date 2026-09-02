@@ -18,8 +18,10 @@ import { createMemo, createSignal, createEffect, onMount, onCleanup, Show, For, 
 import { PLUGIN_VERSION } from "./_version"
 import { balanceProviders, getBalanceProvider, maskKey, matchBalanceProvider, type BalanceDetail, type BalanceDetailKey, type BalanceEntry, type BalanceProvider } from "./balance-providers"
 import { LANG_META, createT, detectLang, type LangCode, type Translation } from "./i18n"
-import { num, estimateTokens } from "./tokens"
-import { computePerfSample, computeLivePerf, type LivePerf } from "./perf"
+import { num } from "./tokens"
+import { computePerfSample, computeLivePerf, aggregatePerf, EMPTY_PERF, type LivePerf, type PerfStats } from "./perf"
+import { collectTokenDist, type TokenDist } from "./dist"
+import { shallowEqual, createThrottledBumper } from "./util"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -224,40 +226,10 @@ function fmtMs(ms: number): string {
   return (ms / 1000).toFixed(1) + "s"
 }
 
-interface TokenDist {
-  system: number   // UserMessage.system
-  user: number     // user message text/file parts
-  agent: number    // task tool input prompt/description (sub-agent delegation)
-  toolCall: number // ToolPart.input (actual tool params)
-  toolResult: number // ToolPart completed output / error
-  output: number   // AssistantMessage.tokens.output (API exact, reasoning excluded)
-  reasoning: number // AssistantMessage.tokens.reasoning (API exact)
-  apiOutput: number // StepFinishPart.tokens.output (API exact, preferred)
-  apiInput: number  // API exact total input context (input + cache read + cache write)
-  stepCost: number  // last step-finish part cost (USD) in the current round
-  stepCount: number // step-finish parts count across the current round (parentID chain)
-}
-
-// ── performance stats ──
-// TTFT/TPS/latency 的采样口径与实时估算实现见 ./perf.ts（computePerfSample /
-// computeLivePerf 唯一实现），此处仅定义侧边栏/hint 栏展示用的聚合形状。
-interface PerfStats {
-  ttftLast: number | null // 最近一次首字延迟 (ms)
-  tpsLast: number | null  // 最近一次输出速度 (tok/s)
-  latLast: number | null  // 最近一次净模型延迟 (ms，已扣工具执行窗口)
-  ttftAvg: number | null  // 会话平均首字延迟 (ms)
-  tpsAvg: number | null   // 会话平均输出速度 (tok/s)
-  latAvg: number | null   // 会话平均净模型延迟 (ms)
-  ttftN: number           // 有效样本数（TTFT/延迟共用；压缩消息与纯工具 step 不计）
-  tpsN: number            // TPS 有效样本数（缓冲网关守卫记 null 的样本不计入）
-  hasPerf: boolean        // 是否存在有效样本
-}
-
-const EMPTY_PERF: PerfStats = {
-  ttftLast: null, tpsLast: null, latLast: null,
-  ttftAvg: null, tpsAvg: null, latAvg: null,
-  ttftN: 0, tpsN: 0, hasPerf: false,
-}
+// ── token 分布 / 性能聚合 ──
+// TokenDist 与收集函数（collectTokenDist/collectRoundUsage，含 per-message
+// 指纹缓存）见 ./dist.ts；PerfStats / aggregatePerf 见 ./perf.ts。
+// 两者均为纯统计（不建立响应式依赖），调用方须在 untrack 内调用。
 
 // 流式活跃期间的 250ms 心跳：part 事件只随 delta 到达，长时间无增量（深度思考、
 // 缓冲网关、step 间隙）时由心跳推动时钟前进；空闲时 interval 不存在，零常驻开销。
@@ -523,6 +495,9 @@ const DEFAULT_RATES: Record<string, number> = {
 }
 
 const MIN_PANEL_WIDTH = 20
+// part 事件 → data effect 重算的节流间隔（前沿+尾沿）：重算上限 10Hz，
+// 数值更新延迟最多 +100ms；与旧 debounce 同值
+const PART_THROTTLE_MS = 100
 const DEFAULT_PANEL_WIDTH = 26
 
 /** ── layout measurement constants (visual columns) ── */
@@ -698,6 +673,10 @@ function TokenCachePanel(props: {
 
   createEffect(() => {
     const sid = props.signals.overrideSessionId() ?? props.sessionId
+    // 双通道驱动：partVersion（part/msg 事件，100ms 节流）承担高频 part 增量；
+    // refreshTick（仅 session.updated）承担 session 级变化（聚合 tokens/model
+    // 切换），step 级频率即时生效。重算成本已由 dist.ts 的指纹缓存摊平，
+    // 但节流仍是第一道闸（聚合循环本身 O(消息数) 也不必跑在事件频率上）。
     void refreshTick()
     void partVersion()
 
@@ -752,120 +731,26 @@ function TokenCachePanel(props: {
     const hasTrendData = prevMsgHitRate >= 0 && lastMsgHitRate >= 0
     const trend = hasTrendData ? lastMsgHitRate - prevMsgHitRate : 0, providerName = pid || ""
 
-    // untrack 只包裹已知触发死锁的 API
+    // untrack 只包裹已知触发死锁的 API；分布/性能聚合已抽为纯函数
+    // （collectTokenDist / aggregatePerf），lastDist/lastPerf 回退同样只在
+    // untrack 内读取（避免响应式依赖成环）
     const distData = untrack(() => {
-      let dist: TokenDist = { system: 0, user: 0, agent: 0, toolCall: 0, toolResult: 0, output: 0, reasoning: 0, apiOutput: 0, apiInput: 0, stepCost: 0, stepCount: 0 }
-      let hasDistData = false
-      let perf: PerfStats = { ...EMPTY_PERF }
-      const loadedSkills = new Map<string, { name: string; tokens: number }>()
       try {
-        const cfg = props.api.state.config as Record<string, unknown>
-        const agentName = String(session?.agent ?? (cfg as any)?.default_agent ?? "build")
-        const agents = cfg?.agent as Record<string, unknown> | undefined
-        const agentCfg = agents?.[agentName] as Record<string, unknown> | undefined
-        const sysPrompt = typeof agentCfg?.prompt === "string" ? agentCfg.prompt : ""
-        if (sysPrompt) dist.system = estimateTokens(sysPrompt)
-        let lastAssMsg: AssistantMessage | undefined
-        for (const msg of msgs) {
-          if (msg.role === "user") {
-            const um = msg as UserMessage; if (um.system) dist.system += estimateTokens(um.system)
-            let parts: readonly Part[] = []; try { parts = props.api.state.part(msg.id) } catch {}
-            for (const p of parts) {
-              if (p.type === "text" && !(p as any).synthetic && !(p as any).ignored) dist.user += estimateTokens((p as any).text)
-              else if (p.type === "file") { const fp = p as any; if (fp.source?.text?.value) dist.user += estimateTokens(fp.source.text.value) }
-            }
-          } else if (msg.role === "assistant") {
-            const am = msg as AssistantMessage
-            dist.output += num(am.tokens?.output)
-            dist.reasoning += num(am.tokens?.reasoning)
-            let parts: readonly Part[] = []; try { parts = props.api.state.part(msg.id) } catch {}
-            for (const p of parts) {
-              if (p.type === "tool") {
-                const tp = p as any; let rawInput = ""
-                try { rawInput = tp.state.raw ?? (tp.state.input != null ? JSON.stringify(tp.state.input) : "") } catch {}
-                if (rawInput) dist.toolCall += estimateTokens(rawInput)
-                // 子代理委托（task 工具）：任务描述计入子代理指令（1.15.x 无 subtask part）
-                if (tp.tool === "task" && tp.state?.input) {
-                  const ti = tp.state.input
-                  const prompt = typeof ti.prompt === "string" ? ti.prompt : ""
-                  const desc = typeof ti.description === "string" ? ti.description : ""
-                  dist.agent += estimateTokens(prompt || desc)
-                }
-                if (tp.state.status === "completed") { const c = tp.state; if (c.output) dist.toolResult += estimateTokens(c.output) }
-                else if (tp.state.status === "error") { const e = tp.state; if (e.error) dist.toolResult += estimateTokens(e.error) }
-                if (tp.tool === "skill" && tp.state.status === "completed") {
-                  // TUI SDK strips tool metadata — extract skill name from well-known output format.
-                  // Cross-validated against api.client.app.skills() when available.
-                  let name: string | undefined = tp.state.metadata?.name
-                  if (typeof name !== "string") {
-                    const m = typeof tp.state.output === "string"
-                      ? tp.state.output.match(/^#{1,2}\s*Skill:\s*(.+)/m)
-                      : null
-                    if (m) name = m[1].trim()
-                  }
-                  if (typeof name === "string") {
-                    const tokens = typeof tp.state.output === "string" ? estimateTokens(tp.state.output) : 0
-                    const existing = loadedSkills.get(name)
-                    if (!existing || existing.tokens < tokens) {
-                      loadedSkills.set(name, { name, tokens })
-                    }
-                  }
-                }
-            } else if (p.type === "subtask") { const sub = p as any; dist.agent += estimateTokens(sub.prompt || sub.description || "") }
-            }
-            // 性能样本：computePerfSample 唯一实现（hint 栏 lastTps 共用，防双源漂移）
-            const sample = computePerfSample(am, parts)
-            if (sample) {
-              perf.ttftN++
-              perf.latLast = sample.latency
-              perf.latAvg = perf.latAvg === null ? sample.latency : perf.latAvg + (sample.latency - perf.latAvg) / perf.ttftN
-              perf.ttftLast = sample.ttft
-              perf.ttftAvg = perf.ttftAvg === null ? sample.ttft : perf.ttftAvg + (sample.ttft - perf.ttftAvg) / perf.ttftN
-              if (sample.tps !== null) {
-                perf.tpsN++
-                perf.tpsLast = sample.tps
-                perf.tpsAvg = perf.tpsAvg === null ? sample.tps : perf.tpsAvg + (sample.tps - perf.tpsAvg) / perf.tpsN
-              }
-              perf.hasPerf = true
-            }
-          }
+        const { dist, hasDistData, skills } = collectTokenDist(props.api, msgs, session)
+        const perf = aggregatePerf(props.api, msgs)
+        return {
+          finalDist: hasDistData ? dist : lastDist(), finalHasDist: hasDistData || lastHasDist(),
+          finalPerf: perf.hasPerf ? perf : lastPerf(), finalHasPerf: perf.hasPerf || lastHasPerf(),
+          skills,
         }
-        // 从后往前找最后一条有 token 数据的 assistant 消息（避免取到 streaming 中未填充的消息）
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].role !== "assistant") continue
-          const tok = (msgs[i] as AssistantMessage).tokens
-          if (tok && ((tok.input ?? 0) > 0 || (tok.cache?.read ?? 0) > 0 || (tok.cache?.write ?? 0) > 0)) { lastAssMsg = msgs[i] as AssistantMessage; break }
+      } catch {
+        // SDK 形状漂移等意外错误：回落最近一次有效快照，保持面板稳定
+        return {
+          finalDist: lastDist(), finalHasDist: lastHasDist(),
+          finalPerf: lastPerf(), finalHasPerf: lastHasPerf(),
+          skills: [] as { name: string; tokens: number }[],
         }
-        // 取最后一条有数据消息的总输入（含缓存读/写）作为当前 context 大小
-        dist.apiInput = num(lastAssMsg?.tokens?.input) + num(lastAssMsg?.tokens?.cache?.read) + num(lastAssMsg?.tokens?.cache?.write)
-        dist.apiOutput = num(lastAssMsg?.tokens?.output)
-        // 本回合（最后一条有数据消息所在的 parentID 链）的 API 调用次数与末次成本。
-        // opencode 将回合内每次工具调用循环拆为独立 assistant 消息（各含 1 个 step-finish），
-        // 故按 parentID 链聚合统计，而非单条消息。
-        if (lastAssMsg) {
-          const roundParent = (lastAssMsg as AssistantMessage).parentID
-          let lastCost: number | undefined
-          for (let i = msgs.length - 1; i >= 0; i--) {
-            const m = msgs[i]
-            if (m.role !== "assistant") continue
-            if ((m as AssistantMessage).parentID !== roundParent) break
-            let parts: readonly Part[] = []; try { parts = props.api.state.part(m.id) } catch {}
-            for (const p of parts) {
-              if (p.type !== "step-finish") continue
-              dist.stepCount++
-              const sc = (p as { cost?: unknown }).cost
-              if (lastCost === undefined && typeof sc === "number" && Number.isFinite(sc)) lastCost = sc
-            }
-          }
-          if (lastCost !== undefined) dist.stepCost = lastCost
-        }
-        hasDistData = dist.system + dist.user + dist.agent + dist.toolCall + dist.toolResult > 0 || dist.apiOutput > 0 || dist.apiInput > 0 || dist.reasoning > 0
-      } catch {}
-      const finalDist = hasDistData ? dist : lastDist(), finalHasDist = hasDistData || lastHasDist()
-      // 性能快照回退与 dist 同策略（lastPerf 读取在 untrack 内，避免响应式依赖成环）
-      const finalPerf = perf.hasPerf ? perf : lastPerf(), finalHasPerf = perf.hasPerf || lastHasPerf()
-      const skills = [...loadedSkills.values()]
-      return { finalDist, finalHasDist, finalPerf, finalHasPerf, skills }
+      }
     })
 
     setDataSignal({
@@ -887,15 +772,17 @@ function TokenCachePanel(props: {
 
   // Persist the last valid distribution so that data() can fall back
   // to it while api.state.part() is re-hydrating after a view switch.
+  // 浅比较去重：流式期间 data 高频重算但内容多数不变，跳过无变化的
+  // 信号写入与 KV 快照（lastDist 读取在 untrack 内，避免依赖成环）。
   createEffect(() => {
     const d = data()
-    if (d.hasDistData) {
+    if (d.hasDistData && !untrack(() => shallowEqual(lastDist(), d.dist))) {
       setLastDist({ ...d.dist })
       setLastHasDist(true)
       // Also persist across component remounts (view switches)
       try { props.api.kv.set(`${KV_PREFIX}.dist_snapshot`, { ...d.dist }) } catch {}
     }
-    if (d.hasPerf) {
+    if (d.hasPerf && !untrack(() => shallowEqual(lastPerf(), d.perf))) {
       setLastPerf({ ...d.perf })
       setLastHasPerf(true)
       try { props.api.kv.set(`${KV_PREFIX}.perf_snapshot`, { ...d.perf }) } catch {}
@@ -1003,19 +890,18 @@ function TokenCachePanel(props: {
       pollRestore()
     }
 
-    // Debounce partVersion updates so that event bursts during session
-    // switching / streaming don't cause data() to re-compute on every
-    // single event (up to hundreds per second on Linux single-thread).
-    let partTimer: ReturnType<typeof setTimeout> | undefined
-    const bumpPartVersion = () => {
-      clearTimeout(partTimer)
-      partTimer = setTimeout(() => setPartVersion((v) => v + 1), 100)
-    }
-    const unsubPart = props.api.event.on("message.part.updated", () => { bumpPartVersion(); setRefreshTick(v => v + 1) })
-    const unsubMsg = props.api.event.on("message.updated", () => { bumpPartVersion(); setRefreshTick(v => v + 1) })
+    // part/msg 事件 → partVersion（前沿+尾沿节流，间隔 PART_THROTTLE_MS）：
+    // 突发流式期间重算钳到 ≤10Hz，首事件立即生效（step completed 的精确值
+    // 落地时机不变）。旧实现为纯尾沿去抖，连续 delta 流下定时器不断重置会
+    // 饿死，故曾依赖 refreshTick 按事件频率重跑兜底——节流后 data effect
+    // 只跟 partVersion；refreshTick 仅由 session.updated 驱动（session 聚合
+    // tokens/model 变化即时生效，step 级频率，不构成热点）。
+    const bumper = createThrottledBumper(() => setPartVersion((v) => v + 1), PART_THROTTLE_MS)
+    const unsubPart = props.api.event.on("message.part.updated", bumper.bump)
+    const unsubMsg = props.api.event.on("message.updated", bumper.bump)
     const unsubSession = props.api.event.on("session.updated", () => { setRefreshTick(v => v + 1) })
     setRefreshTick(v => v + 1)
-    onCleanup(() => { clearTimeout(partTimer); unsubPart(); unsubMsg(); unsubSession() })
+    onCleanup(() => { bumper.dispose(); unsubPart(); unsubMsg(); unsubSession() })
   })
 
   // ── colours ──

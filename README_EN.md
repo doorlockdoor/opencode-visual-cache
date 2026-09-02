@@ -7,9 +7,9 @@ Vibe-forked from opencode-visual-cache, adding first-token latency (TTFT), gener
 </div>
 
 Included metrics:
-- **TTFT**: Time to first token — perceived time from when the request (step) is sent to when the first token arrives.
+- **TTFT**: Time to first token — perceived time from when the user sends a request (step) to when the first token arrives.
 - **TPS**: Token generation speed (excluding tool-call time).
-- **Latency**: Model generation time per request (step), excluding tool-call time.
+- **Latency**: Model generation time per request (step) — perceived time, excluding tool-call time.
 - Errors introduced by OpenCode's auto-compaction are ignored, and counting is paused while tools are suspended (e.g. asking a question).
 
 ## Local Build

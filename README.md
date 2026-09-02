@@ -7,9 +7,9 @@ Vibe自opencode-visual-cache，新增首字延迟（TTFT），生成速度（TPS
 </div>
 
 信息包含：
-- **TTFT**：首字延迟，从请求（step）发起到第一个token的体感时间。
+- **TTFT**：首字延迟，从用户发出请求（step）到第一个token的体感时间。
 - **TPS**：token生成速度（去除工具调用时间）。
-- **Latency**：单次请求（step）的模型生成耗时（去除工具调用时间）。
+- **Latency**：单次请求（step）的模型生成耗时（体感时间，去除工具调用时间）。
 - 忽略opencode自动压缩造成的误差，忽略工具暂停（例如提问）时的计数。
 
 ## 本地构建

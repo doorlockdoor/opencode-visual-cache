@@ -8,19 +8,20 @@ export function num(v: unknown): number {
 }
 
 // ── token estimation ──
-// Character-based BPE approximation.  Default ratios (~4 ASCII or ~1.5 CJK
-// chars per token) work well for natural language but systematically
-// under-count tokens in JSON and source code where every punctuation mark
-// tends to be its own token.  Detect these cases and tighten the ratio.
+// Character-based BPE approximation.  o200k/cl100k 平均压缩率：ASCII ~4 chars/token
+// （JSON/代码 ~3.5）、汉字 ~1.5 chars/token、假名/谚文 ~1.0 chars/token。
+// 默认比例对自然语言较准，但 JSON 与源代码中几乎每个标点都是独立 token，
+// 系统性低估——检测到这些形态后收紧 ASCII 比例。
 // See: GPT-4 / Claude tokenizer behaviour with structured text.
 
 export function estimateTokens(text: string): number {
   if (!text || text.length === 0) return 0
   let ascii = 0
-  let cjk = 0
+  let cjk = 0 // 假名/谚文等：分词压缩率接近 1 字/token
+  let han = 0 // 汉字：o200k 平均 ~1.5 字/token
   for (const c of text) {
     const code = c.codePointAt(0) ?? 0
-    if (code >= 0x4E00 && code <= 0x9FFF) cjk++       // CJK Unified
+    if (code >= 0x4E00 && code <= 0x9FFF) han++        // CJK Unified 汉字
     else if (code >= 0x3040 && code <= 0x30FF) cjk++   // Hiragana/Katakana
     else if (code >= 0xAC00 && code <= 0xD7A3) cjk++   // Hangul
     else if (code >= 0x1100 && code <= 0x11FF) cjk++   // Hangul Jamo
@@ -42,5 +43,5 @@ export function estimateTokens(text: string): number {
     && /```|^import |^export |^function |^const |^let |^var |^class |^interface |^type |^def |^fn |^pub |^use |^mod |^package /m.test(text)
 
   const asciiPerToken = jsonLike ? 3.5 : codeLike ? 3.5 : 4
-  return Math.max(1, Math.ceil(ascii / asciiPerToken + cjk / 1.0))
+  return Math.max(1, Math.ceil(ascii / asciiPerToken + cjk / 1.0 + han / 1.5))
 }
