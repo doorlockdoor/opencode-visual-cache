@@ -166,8 +166,9 @@ export function aggregatePerf(api: TuiPluginApi, msgs: readonly Message[]): Perf
 //   TPS：Σ estimateTokens(text/reasoning part 累积文本) / 纯生成时长
 //         含 reasoning 字符（思考阶段也有速度可读），与结束后精确口径
 //         （(output+reasoning)/净生成，同样含思考 token）一致，仅剩
-//         estimateTokens 的估算误差（汉字按 1.5 字/token，o200k 口径
-//         残余 ~±20%），故显示时保留 "≈" 标记，step 结束后由精确口径覆盖。
+//         estimateTokens 的估算误差——按 part 形态分档校准（reasoning 走
+//         "thinking" 密度、text 走 "answer" 密度，见 src/tokens.ts 的实测
+//         依据），残余 ~±5%，故显示时保留 "≈" 标记，step 结束后由精确口径覆盖。
 //   纯生成时长：now − 首个 part start − 已完成工具区间并集（并行重叠去重、
 //         钳位到生成窗口）。工具在 LLM 流内执行（含 question 等待作答）：
 //         工具 part 处于 pending/running 期间模型不产出 token，恢复生成后
@@ -249,7 +250,7 @@ export function computeLivePerf(api: TuiPluginApi, sid: string): LivePerf | null
       const st = tm?.start
       if (typeof st === "number" && st > 0 && (firstStart === undefined || st < firstStart)) firstStart = st
       const txt = (p as { text?: unknown }).text
-      if (typeof txt === "string" && txt) estTok += estimateTokens(txt)
+      if (typeof txt === "string" && txt) estTok += estimateTokens(txt, p.type === "reasoning" ? "thinking" : "answer")
     }
     const now = Date.now()
     // 工具运行中 → 显示工具计时（含纯工具调用消息）

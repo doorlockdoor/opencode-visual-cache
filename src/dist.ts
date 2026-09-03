@@ -139,7 +139,7 @@ function scanMessageDist(msg: Message, parts: readonly Part[]): DistSub {
       const tp = p as any
       let rawInput = ""
       try { rawInput = tp.state.raw ?? (tp.state.input != null ? JSON.stringify(tp.state.input) : "") } catch {}
-      if (rawInput) sub.toolCall += estimateTokens(rawInput)
+      if (rawInput) sub.toolCall += estimateTokens(rawInput, "code")
       // 子代理委托（task 工具）：任务描述计入子代理指令（1.15.x 无 subtask part）
       if (tp.tool === "task" && tp.state?.input) {
         const ti = tp.state.input
@@ -147,8 +147,8 @@ function scanMessageDist(msg: Message, parts: readonly Part[]): DistSub {
         const desc = typeof ti.description === "string" ? ti.description : ""
         sub.agent += estimateTokens(prompt || desc)
       }
-      if (tp.state.status === "completed") { if (tp.state.output) sub.toolResult += estimateTokens(tp.state.output) }
-      else if (tp.state.status === "error") { if (tp.state.error) sub.toolResult += estimateTokens(tp.state.error) }
+      if (tp.state.status === "completed") { if (tp.state.output) sub.toolResult += estimateTokens(tp.state.output, "code") }
+      else if (tp.state.status === "error") { if (tp.state.error) sub.toolResult += estimateTokens(tp.state.error, "code") }
       if (tp.tool === "skill" && tp.state.status === "completed") {
         const output = typeof tp.state.output === "string" ? tp.state.output : ""
         const name = typeof tp.state.metadata?.name === "string" ? tp.state.metadata.name : skillNameFromOutput(output)

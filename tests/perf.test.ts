@@ -8,14 +8,19 @@ import type { Part } from "@opencode-ai/sdk/v2"
 // ── estimateTokens ─────────────────────────────────────────────────────────
 
 assert.equal(estimateTokens(""), 0)
-assert.equal(estimateTokens("hello"), 2) // 5 ASCII / 4 → ceil 2
+assert.equal(estimateTokens("hello"), 2) // 5 ASCII / 3.3 → ceil 2
 assert.equal(estimateTokens("你好"), 2) // 2 汉字 / 1.5 → ceil 2
 assert.equal(estimateTokens("你好世界"), 3) // 4 汉字 / 1.5 → ceil 3
-assert.equal(estimateTokens("你好abc"), 3) // 2 汉字/1.5 + 3 ASCII/4 → ceil 3
+assert.equal(estimateTokens("你好abc"), 3) // 2 汉字/1.5 + 3 ASCII/3.3 → ceil 3
 assert.equal(estimateTokens("かな"), 2) // 假名按 1 字/token（与汉字区分）
-assert.equal(estimateTokens("{}"), 1) // 无 "key": 不判 JSON，按 prose 2/4 → 1
-assert.equal(estimateTokens('{"a":1}'), 2) // JSON：7 ASCII / 3.5 → 2
-assert.equal(estimateTokens("import x from 'y'"), 5) // code：17 ASCII / 3.5 → 5
+assert.equal(estimateTokens("{}"), 1) // 无 "key": 不判 JSON，按 prose 2/3.3 → 1
+assert.equal(estimateTokens('{"a":1}'), 2) // JSON：7 ASCII / 3.7 → 2
+assert.equal(estimateTokens("import x from 'y'"), 5) // code：17 ASCII / 3.7 → 5
+// profile 分档：reasoning("thinking") / text("answer") / tool("code")
+assert.equal(estimateTokens("hello world", "thinking"), 3) // 11 ASCII / 4.0 → 3
+assert.equal(estimateTokens("hello world", "answer"), 4) // 11 ASCII / 3.0 → 4
+assert.equal(estimateTokens("你好abc", "answer"), 3) // 2/1.5 + 3/3.0 → 3
+assert.equal(estimateTokens('{"cmd":"x"}', "code"), 3) // code 档不检测形态，11 ASCII / 3.7 → 3
 
 // ── num ────────────────────────────────────────────────────────────────────
 
@@ -198,7 +203,7 @@ function runningToolPart(start: number): Part {
 
 // streaming：首字精确 + 估算速度
 {
-  const longText = "a".repeat(40) // estimateTokens = 10
+  const longText = "a".repeat(40) // answer 档估算 = 40/3.0 → ceil 14
   const api = makeApi({
     status: () => ({ type: "busy" }),
     messages: () => [liveAm()],
@@ -211,7 +216,7 @@ function runningToolPart(start: number): Part {
     assert.ok(lv && lv.phase === "streaming")
     if (lv && lv.phase === "streaming") {
       assert.equal(lv.ttft, 500)
-      assert.ok(Math.abs(lv.tps! - 4.0) < 1e-9) // 10 tok / 2500ms × 1000
+      assert.ok(Math.abs(lv.tps! - 5.6) < 1e-9) // 14 tok / 2500ms × 1000
     }
   } finally {
     Date.now = origNow
