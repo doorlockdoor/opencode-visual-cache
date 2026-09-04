@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { estimateTokens, num } from "../src/tokens"
-import { computePerfSample, computeLivePerf, aggregatePerf } from "../src/perf"
+import { computePerfSample, computeLivePerf, aggregatePerf, modelKeyOf, currentModelKey } from "../src/perf"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { AssistantMessage, Message } from "@opencode-ai/sdk"
 import type { Part } from "@opencode-ai/sdk/v2"
@@ -211,12 +211,83 @@ assert.equal(bigParam.latency, 1000) // 3000−1000−1000
   assert.equal(perf.hasPerf, true)
 }
 
+// ── model filter helpers ───────────────────────────────────────────────────
+
+// 同一 modelID 走不同 provider 视为不同模型（速度差异可能数倍）
+assert.equal(modelKeyOf(am()), "prov/model")
+assert.equal(modelKeyOf(am({ modelID: "b", providerID: "p" })), "p/b")
+assert.equal(modelKeyOf(am({ modelID: "" })), null) // 旧版数据缺字段 → null
+assert.ok(modelKeyOf(am({ providerID: "" })) === null)
+
+// currentModelKey：优先 session.model（切换模型后立即生效），回退最后一条消息
+{
+  const api = makeApi({
+    messages: () => [am({ id: "old", modelID: "old-m", providerID: "p" })] as unknown as Message[],
+    parts: () => [],
+    get: () => ({ model: { id: "new-m", providerID: "p" } }),
+  })
+  assert.equal(currentModelKey(api, "s1"), "p/new-m")
+  // session.model 缺失 → 回退最后一条 assistant 消息
+  const api2 = makeApi({
+    messages: () => [
+      am({ id: "old", modelID: "old-m", providerID: "p" }),
+      am({ id: "new", modelID: "new-m", providerID: "p", summary: true }),
+    ] as unknown as Message[],
+    parts: () => [],
+    get: () => undefined,
+  })
+  assert.equal(currentModelKey(api2, "s1"), "p/new-m") // summary 也算消息归属模型
+  // 全部不可知 → null（调用方退化为全局不过滤）
+  const api3 = makeApi({
+    messages: () => [am({ modelID: "" })] as unknown as Message[],
+    parts: () => [],
+    get: () => undefined,
+  })
+  assert.equal(currentModelKey(api3, "s1"), null)
+}
+
+// aggregatePerf 按模型过滤：混合模型会话中位数/最近值只来自目标模型
+{
+  const msgs = [
+    am({ id: "a", time: { created: 1000, completed: 1600 }, tokens: { input: 1, output: 100, reasoning: 0, cache: { read: 0, write: 0 } } }),
+    am({ id: "b", time: { created: 2000, completed: 2600 }, tokens: { input: 1, output: 200, reasoning: 0, cache: { read: 0, write: 0 } } }),
+    am({ id: "c", time: { created: 3000, completed: 3600 }, tokens: { input: 1, output: 900, reasoning: 0, cache: { read: 0, write: 0 } }, modelID: "fast", providerID: "p" }),
+    am({ id: "d", time: { created: 4000, completed: 4600 }, tokens: { input: 1, output: 100, reasoning: 0, cache: { read: 0, write: 0 } }, modelID: "fast", providerID: "p" }),
+  ]
+  const api = makeApi({
+    messages: () => [],
+    parts: (mid) => [textPart(mid === "a" ? 1100 : mid === "b" ? 2100 : mid === "c" ? 3100 : 4100)],
+  })
+  // 不过滤：全域统计 [200, 400, 1800, 200] → 中位 (200+400)/2 = 300
+  const all = aggregatePerf(api, msgs as unknown as Message[])
+  assert.equal(all.tpsN, 4)
+  assert.equal(all.tpsLast, 200)
+  assert.equal(all.tpsMed, 300) // [200, 200, 400, 1800] 中位 = (200+400)/2
+  // 过滤到 p/model（a/b 两条）：只取目标模型
+  const filtered = aggregatePerf(api, msgs as unknown as Message[], { modelKey: "prov/model" })
+  assert.equal(filtered.ttftN, 2)
+  assert.equal(filtered.tpsN, 2)
+  assert.equal(filtered.tpsLast, 400)
+  assert.equal(filtered.tpsMed, 300) // [200, 400]
+  // 过滤到 p/fast（c/d 两条）：高速模型不受低速样本拖累
+  const fast = aggregatePerf(api, msgs as unknown as Message[], { modelKey: "p/fast" })
+  assert.equal(fast.tpsN, 2)
+  assert.equal(fast.tpsLast, 200)
+  assert.equal(fast.tpsMed, 1000) // [200, 1800] → (200+1800)/2 = 1000
+  // 目标模型无样本 → 空统计（hasPerf false）
+  const none = aggregatePerf(api, msgs as unknown as Message[], { modelKey: "p/nope" })
+  assert.equal(none.hasPerf, false)
+  assert.equal(none.tpsN, 0)
+  assert.equal(none.ttftLast, null)
+}
+
 // ── computeLivePerf helpers ────────────────────────────────────────────────
 
 interface ApiOpts {
   status?: (sid: string) => { type: string } | undefined
   messages: (sid: string) => Message[]
   parts: (mid: string) => Part[]
+  get?: (sid: string) => { model?: { id?: string; providerID?: string } } | undefined
 }
 
 function makeApi(opts: ApiOpts): TuiPluginApi {
@@ -225,6 +296,7 @@ function makeApi(opts: ApiOpts): TuiPluginApi {
       session: {
         status: opts.status,
         messages: opts.messages,
+        get: opts.get,
       },
       part: opts.parts,
     },

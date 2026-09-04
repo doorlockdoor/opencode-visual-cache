@@ -190,14 +190,62 @@ function median(values: readonly number[]): number {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
 }
 
+// ── 模型过滤 ──
+// 同一会话跨模型切换（不同模型速度差异极大；同名模型走不同 provider 如
+// OpenRouter vs 直连也可差数倍）会把不同模型样本混进同一聚合，中位数与
+// 最近值均不代表当前模型。每条 assistant 消息自带 modelID/providerID
+// （生成时写入、持久化于数据库），session.model 为下一条提示将使用的模型，
+// 两者皆可响应式读取，过滤零成本（O(1)/消息，O(json) 校验略增）。
+/**
+ * 消息的模型指纹（`providerID/modelID`）。字段缺失（旧版数据）→ null，
+ * 表示无法归属任何模型；过滤开启时该类消息被排除。
+ */
+export function modelKeyOf(am: AssistantMessage): string | null {
+  const p = am.providerID
+  const m = am.modelID
+  return p && m ? `${p}/${m}` : null
+}
+
+/**
+ * 当前会话的模型指纹：优先 `session.model`（下一条回复将使用的模型，
+ * 切换模型后 session 更新即生效，无消息也能得到正确目标），
+ * 回退到最后一条 assistant 消息的模型（旧版 SDK/子代理会话缺 model 信息）。
+ * 返回 null 表示当前模型不可知——调用方可据此退化为"不过滤"（全局统计）。
+ */
+export function currentModelKey(api: TuiPluginApi, sid: string): string | null {
+  try {
+    const session = typeof api.state.session.get === "function" ? api.state.session.get(sid) : undefined
+    const p = session?.model?.providerID
+    const m = session?.model?.id
+    if (p && m) return `${p}/${m}`
+  } catch { /* fall through */ }
+  try {
+    const msgs = api.state.session.messages(sid) as Message[]
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const msg = msgs[i]
+      if (msg.role !== "assistant") continue
+      const k = modelKeyOf(msg as AssistantMessage)
+      if (k) return k
+    }
+  } catch { /* fall through */ }
+  return null
+}
+
+/** aggregatePerf 的可选过滤：modelKey 存在时只统计该模型归属的样本。 */
+export interface PerfFilterOpts {
+  modelKey?: string | null
+}
+
 /** 遍历 assistant 消息逐条采样（computePerfSample 唯一口径），聚合为中位数 PerfStats。 */
-export function aggregatePerf(api: TuiPluginApi, msgs: readonly Message[]): PerfStats {
+export function aggregatePerf(api: TuiPluginApi, msgs: readonly Message[], opts?: PerfFilterOpts): PerfStats {
+  const filterKey = opts?.modelKey || undefined
   const ttfts: number[] = []
   const tpss: number[] = []
   const lats: number[] = []
   for (const msg of msgs) {
     if (msg.role !== "assistant") continue
     const am = msg as AssistantMessage
+    if (filterKey !== undefined && modelKeyOf(am) !== filterKey) continue
     let parts: readonly Part[] = []
     try { parts = api.state.part(am.id) } catch {}
     const sample = computePerfSample(am, parts)

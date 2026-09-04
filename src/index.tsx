@@ -19,7 +19,7 @@ import { PLUGIN_VERSION } from "./_version"
 import { balanceProviders, getBalanceProvider, maskKey, matchBalanceProvider, type BalanceDetail, type BalanceDetailKey, type BalanceEntry, type BalanceProvider } from "./balance-providers"
 import { LANG_META, createT, detectLang, type LangCode, type Translation } from "./i18n"
 import { num } from "./tokens"
-import { computePerfSample, computeLivePerf, aggregatePerf, EMPTY_PERF, type LivePerf, type PerfStats } from "./perf"
+import { computePerfSample, computeLivePerf, aggregatePerf, EMPTY_PERF, modelKeyOf, currentModelKey, type LivePerf, type PerfStats } from "./perf"
 import { collectTokenDist, type TokenDist } from "./dist"
 import { shallowEqual, createThrottledBumper } from "./util"
 
@@ -453,6 +453,9 @@ interface PanelSignals {
   setSectionSkills: (v: boolean) => void
   sectionPerf: () => boolean
   setSectionPerf: (v: boolean) => void
+  /** 性能统计是否按当前模型过滤（切模型后中位数/最近值不混入其他模型）。 */
+  perfModelFilter: () => boolean
+  setPerfModelFilter: (v: boolean) => void
   sectionBalance: () => boolean
   setSectionBalance: (v: boolean) => void
   /** Bottom status bar (prompt hint line) visibility. */
@@ -541,6 +544,7 @@ function TokenCachePanel(props: {
     sectionDist, setSectionDist,
     sectionSkills, setSectionSkills,
     sectionPerf, setSectionPerf,
+    perfModelFilter, setPerfModelFilter,
     sectionBalance, setSectionBalance,
     balanceRefresh,
     balanceProviderId, setBalanceProviderId,
@@ -603,6 +607,8 @@ function TokenCachePanel(props: {
   // KV 快照）让 UI 保持稳定，直到下一次成功计算到来。
   const [lastPerf, setLastPerf] = createSignal<PerfStats>({ ...EMPTY_PERF })
   const [lastHasPerf, setLastHasPerf] = createSignal(false)
+  // 最近有效性能快照的过滤上下文（perfCtx，""=全局；模型切换后不匹配则不回退）
+  const [lastPerfModelKey, setLastPerfModelKey] = createSignal<string | null>(null)
 
   const [dataSignal, setDataSignal] = createSignal<any>({
     hitRate: 0, read: 0, write: 0, freshInput: 0, output: 0,
@@ -613,6 +619,7 @@ function TokenCachePanel(props: {
     hasDistData: false,
     perf: { ...EMPTY_PERF },
     hasPerf: false,
+    perfCtx: "",
     skills: [] as { name: string; tokens: number }[],
     hasSkills: false,
   })
@@ -686,6 +693,12 @@ function TokenCachePanel(props: {
       ? props.api.state.session.get(sid)
       : undefined
 
+    // 性能过滤：开关在 effect 外读取（响应式，切换即重算）；上下文键为
+    // 当前模型指纹，空串表示全局不过滤（含开关开启但模型不可知的退化）。
+    // 聚合在 untrack 内读取 currentModelKey（session/messages 已在外层追踪）。
+    const perfFilterOn = props.signals.perfModelFilter()
+    const perfCtxKey = perfFilterOn ? (currentModelKey(props.api, sid) ?? "") : ""
+
     // 累计值优先使用 Session 聚合字段（数据库级，不受 sync 层 limit:100 截断）
     // 若字段不存在（旧版本 SDK），降级到消息遍历累加
     let input  = session?.tokens?.input ?? 0
@@ -737,10 +750,17 @@ function TokenCachePanel(props: {
     const distData = untrack(() => {
       try {
         const { dist, hasDistData, skills } = collectTokenDist(props.api, msgs, session)
-        const perf = aggregatePerf(props.api, msgs)
+        const perf = aggregatePerf(props.api, msgs, { modelKey: perfCtxKey || undefined })
+        // 过滤上下文决定了哪些"最近有效快照"可回退：模型切换后上下文变化，
+        // 旧快照不再复用（否则会显示其他模型的陈旧统计）；上下文一致时
+        // （part() 重新水合等瞬态）照旧保持面板稳定。perfCtxKey ""=全局。
+        const snapKey = perfCtxKey || null
+        const fallbackOk = perf.hasPerf || (lastPerfModelKey() === snapKey && lastHasPerf())
         return {
           finalDist: hasDistData ? dist : lastDist(), finalHasDist: hasDistData || lastHasDist(),
-          finalPerf: perf.hasPerf ? perf : lastPerf(), finalHasPerf: perf.hasPerf || lastHasPerf(),
+          finalPerf: fallbackOk ? (perf.hasPerf ? perf : lastPerf()) : EMPTY_PERF,
+          finalHasPerf: fallbackOk,
+          perfCtx: perfCtxKey,
           skills,
         }
       } catch {
@@ -748,6 +768,7 @@ function TokenCachePanel(props: {
         return {
           finalDist: lastDist(), finalHasDist: lastHasDist(),
           finalPerf: lastPerf(), finalHasPerf: lastHasPerf(),
+          perfCtx: "",
           skills: [] as { name: string; tokens: number }[],
         }
       }
@@ -760,6 +781,7 @@ function TokenCachePanel(props: {
       trend, hasTrendData, providerName, sessionHitRate,
       dist: distData.finalDist, hasDistData: distData.finalHasDist,
       perf: distData.finalPerf, hasPerf: distData.finalHasPerf,
+      perfCtx: distData.perfCtx,
       skills: distData.skills, hasSkills: distData.skills.length > 0,
     })
   })
@@ -782,10 +804,12 @@ function TokenCachePanel(props: {
       // Also persist across component remounts (view switches)
       try { props.api.kv.set(`${KV_PREFIX}.dist_snapshot`, { ...d.dist }) } catch {}
     }
-    if (d.hasPerf && !untrack(() => shallowEqual(lastPerf(), d.perf))) {
+    if (d.hasPerf && !untrack(() => shallowEqual(lastPerf(), d.perf) && lastPerfModelKey() === (d.perfCtx || null))) {
       setLastPerf({ ...d.perf })
+      setLastPerfModelKey(d.perfCtx || null)
       setLastHasPerf(true)
-      try { props.api.kv.set(`${KV_PREFIX}.perf_snapshot`, { ...d.perf }) } catch {}
+      // 快照携带过滤上下文：不同模型（或全局⇄过滤）的缓存不互相污染
+      try { props.api.kv.set(`${KV_PREFIX}.perf_snapshot`, { ...d.perf, modelKey: d.perfCtx || null }) } catch {}
     }
   })
 
@@ -857,11 +881,15 @@ function TokenCachePanel(props: {
           setLastDist(cachedDist)
           setLastHasDist(true)
         }
-        const cachedPerf = props.api.kv.get<PerfStats>(`${KV_PREFIX}.perf_snapshot`)
+        const cachedPerf = props.api.kv.get<PerfStats & { modelKey?: string | null }>(`${KV_PREFIX}.perf_snapshot`)
         if (cachedPerf) {
           setLastPerf({ ...EMPTY_PERF, ...cachedPerf })
+          setLastPerfModelKey(cachedPerf.modelKey || null)
           setLastHasPerf(true)
         }
+        // Restore performance model-filter preference (default: on)
+        const savedPerfFilter = props.api.kv.get<boolean>(`${KV_PREFIX}.perf_model_filter`, true)
+        setPerfModelFilter(savedPerfFilter !== false)
       } catch {
         // kv read failed — signals stay at defaults
       }
@@ -1402,14 +1430,17 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
   // 从后往前找最近一条能产出有效性能样本的 assistant 消息，取其 TPS。
   // 采样逻辑走 computePerfSample 唯一实现（含 output+reasoning 分子、
   // 工具区间扣除与缓冲网关守卫）；样本 TPS 为 null（缓冲网关）或无样本 → null。
+  // 性能过滤开启时跳过非当前模型的样本，切换模型后不再显示旧模型的速度。
   const lastTps = createMemo(() => {
     const id = sid
     if (!id) return null
+    const mk = props.signals.perfModelFilter() ? currentModelKey(props.api, id) : null
     const msgs = props.api.state.session.messages(id) as Message[]
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i]
       if (m.role !== "assistant") continue
       const am = m as AssistantMessage
+      if (mk && modelKeyOf(am) !== mk) continue
       let parts: readonly Part[] = []
       try { parts = props.api.state.part(am.id) } catch {}
       const s = computePerfSample(am, parts)
@@ -1699,6 +1730,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const [sectionDist, setSectionDist] = createSignal(true)
   const [sectionSkills, setSectionSkills] = createSignal(true)
   const [sectionPerf, setSectionPerf] = createSignal(true)
+  const [perfModelFilter, setPerfModelFilter] = createSignal(true)
   const [sectionBalance, setSectionBalance] = createSignal(true)
   const [sectionBottom, setSectionBottom] = createSignal(true)
   const [balanceRefresh, setBalanceRefresh] = createSignal(0)
@@ -1729,6 +1761,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     sectionDist, setSectionDist,
     sectionSkills, setSectionSkills,
     sectionPerf, setSectionPerf,
+    perfModelFilter, setPerfModelFilter,
     sectionBalance, setSectionBalance,
     sectionBottom, setSectionBottom,
     balanceRefresh, setBalanceRefresh,
@@ -1944,6 +1977,19 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
             }}
           />
         ))
+      },
+    },
+    {
+      title: "Cache: Toggle Perf Model Filter",
+      value: "cache.perffilter",
+      description: "Filter performance stats (TTFT/TPS/latency) to the current session model",
+      slash: { name: "cache-perf-filter" },
+      onSelect: () => {
+        const t = createT(() => langCode())
+        const cur = Boolean(api.kv.get(`${KV_PREFIX}.perf_model_filter`, true))
+        api.kv.set(`${KV_PREFIX}.perf_model_filter`, !cur)
+        signals.setPerfModelFilter(!cur)
+        api.ui.toast({ message: t(!cur ? "perfFilterOn" : "perfFilterOff") })
       },
     },
     {
