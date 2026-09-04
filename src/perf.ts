@@ -9,11 +9,12 @@ import { estimateTokens, num } from "./tokens"
 //            （体感口径：含 DB 写、工具注册解析、git 快照、HTTP 建连与重试等待等
 //             本地预处理开销，略大于 provider 报告的 TTFT）
 //   净生成 = time.completed − 首个 part start − 工具执行窗口∩生成区间
-//   TPS    = (output + reasoning) tokens / 净生成 × 1000
+//   TPS    = (output + reasoning) / 净生成 × 1000
 //            窗口从首个内容 part（含 reasoning）起算，覆盖思考+回答全程，
 //            分子须含思考 token——opencode 的 tokens.output 已被
-//            provider 侧扣除 reasoning（session.ts getUsage），只取 output
-//            会把思考占比稀释成 1/3 级别的虚假低速（实测 10 vs 30+ tok/s）
+//            provider 侧扣除 reasoning（session.ts getUsage；Anthropic
+//            例外整体在 output 里、reasoning 恒 0，加回 reasoning 同样正确），
+//            只取 output 会把思考占比稀释成 1/3 级别的虚假低速（实测 10 vs 30+ tok/s）。
 //   延迟   = time.completed − time.created − 工具执行窗口∩生成区间（净模型耗时）
 // 修正点（与 throughput/tokenwatch 的差异）：
 //   1. 取最早的 part 时间而非最后一个，避免把后续 part 误当首个而高估 TTFT（tokenwatch）
@@ -21,15 +22,29 @@ import { estimateTokens, num } from "./tokens"
 //      故按 tool part 的 state.time.start/end（区间合并去重）扣除工具等待，
 //      工具密集的 step 不再拉低 TPS / 拉高延迟；首内容前的服务端工具时间计入 TTFT
 //   3. 压缩（summary）消息与纯工具 step（无内容 part）不计入样本
-//   4. 非流式/缓冲网关（生成窗口 <30ms 或 <0.2ms/token）时 TPS 记 null 而非输出虚高值，
-//      均值按各自有效子集计数（ttftN / tpsN），null 样本不稀释 tpsAvg
+//   4. 小步噪声守卫（生成窗口 <500ms 时时间戳噪声占比过大，实测 50ms 级
+//      小步 TPS 虚高至 1500+）与缓冲网关守卫（<0.2ms/token，非流式瞬间
+//      吐出）触发时 TPS 记 null 而非输出虚高值，均值按有效子集计数
+//      （ttftN / tpsN），null 样本不稀释 tpsAvg
 //   5. 采样逻辑单一实现 computePerfSample，侧边栏累计与 hint 栏 lastTps 共用
 //      （曾因 hint 栏独立副本漏加 reasoning 分子、漏扣工具区间，同屏差 4 倍）
+//   6. 工具窗口口径（1.18 AI SDK 流，源码验证）：state.time.start 打在
+//      tool-call 事件——参数 JSON 全部流式生成完毕并解析之后（processor.ts
+//      "tool-call" 分支），end 打在 tool-result——即 [start,end] 为纯工具执行
+//      窗口，参数生成期无时间戳标记、连同参数 token 一并留在净生成窗口内。
+//      故分子分母口径一致（output+reasoning 含工具参数、净生成含参数生成
+//      时长），参数产速与内容产速一致时测得值即真实生成速率；写大文档等
+//      参数密集 step 不再被分子扣除参数的偏差压低（此前曾按"窗口涵盖参数
+//      生成+执行"扣除参数 token——例：真速 30 tok/s 时 0.5K 说明 + 4K write
+//      参数读数仅约 3.3 tok/s，大参数 step 甚至因 visTok≤0 被整体丢弃，
+//      故推倒该口径）。
 // 状态驱动：消息与 part 的时间戳持久化在数据库中，直接响应式推导——
 // 历史会话与子代理会话自动生效，无需事件监听、缓存或文件日志。
 
-// 缓冲网关守卫阈值：生成窗口过短或每 token 耗时过低时，TPS 不可信 → 记 null。
-export const MIN_GEN_MS = 30
+// 小步噪声守卫：生成窗口 <500ms 时 completed 等时间戳的噪声占比过大，TPS
+// 不可信（实测 50ms 级小步虚高至 1500+）→ 记 null。与实时口径对齐（LIVE_MIN_GEN_MS）。
+export const MIN_GEN_MS = 500
+// 缓冲网关守卫：每 token 耗时 <0.2ms（非流式瞬间吐出）时 TPS 不可信 → 记 null。
 export const BUFFER_MS_PER_TOKEN = 0.2
 // 实时估算守卫：生成窗口 <500ms 或产出 <8 token 时波动过大，不显示速度。
 export const LIVE_MIN_GEN_MS = 500
@@ -81,7 +96,10 @@ export function computePerfSample(
   const genTok = outputTok + reasoningTok
   if (genTok <= 0) return null
   // 首个内容 part (text/reasoning) 的开始时间 = 首 token 到达时刻，取最早值；
-  // 工具执行窗口 [start, end] 列表（completed/error 才有完整时间）
+  // 工具执行窗口 [start, end] 列表（completed/error 才有完整时间）。
+  // 窗口语义 = 纯执行（tool-call 事件在参数 JSON 流式生成完毕、解析后写入，
+  // tool-result 写 end），参数生成期无时间戳标记 → 保留在净生成窗口内；
+  // 故分子含参数 token、分母含参数生成时长（口径对齐，见头部修正点 6）
   let firstStart: number | undefined
   let toolIvs: [number, number][] | null = null
   for (const p of parts) {
@@ -103,11 +121,13 @@ export function computePerfSample(
   // 注意：这里钳位到 [fs, completed]，即首内容前的工具时间不参与扣减——
   // 它被计入 TTFT（体感口径）；latency 也因此与 TTFT 保持同一扣减基准。
   // 若需严格“净模型耗时”，应改用 [created, completed] 钳位，当前为有意约定。
+  // 已知偏差：[start,end] 为纯执行窗口；参数生成期无时间戳（含在延迟与
+  // 净生成内，体感口径），TTFT 同基准。
   const toolMs = toolIvs ? mergedIntervalMs(toolIvs, fs, completed) : 0
   const ttft = fs - created
   const genMs = Math.max(0, completed - fs - toolMs)
   const latency = Math.max(0, completed - created - toolMs)
-  // 非流式/缓冲网关守卫：生成窗口 <MIN_GEN_MS 或 <BUFFER_MS_PER_TOKEN/token 时不可信 → TPS 记 null
+  // 守卫（小步噪声 + 缓冲网关）任一触发：TPS 记 null，ttft/latency 照常返回
   const tps = genMs >= Math.max(MIN_GEN_MS, genTok * BUFFER_MS_PER_TOKEN) ? (genTok / genMs) * 1000 : null
   return { ttft, tps, latency }
 }

@@ -57,7 +57,7 @@ function reasoningPart(start: number, text = "x"): Part {
   return { id: "r", sessionID: "s1", messageID: "m1", type: "reasoning", text, time: { start } } as unknown as Part
 }
 
-function toolPart(start: number, end: number): Part {
+function toolPart(start: number, end: number, raw?: string): Part {
   return {
     id: "tl",
     sessionID: "s1",
@@ -65,7 +65,7 @@ function toolPart(start: number, end: number): Part {
     type: "tool",
     callID: "c",
     tool: "bash",
-    state: { status: "completed", time: { start, end } },
+    state: { status: "completed", time: { start, end }, ...(raw !== undefined ? { raw } : {}) },
   } as unknown as Part
 }
 
@@ -89,6 +89,31 @@ assert.equal(withTool.ttft, 500)
 assert.equal(withTool.latency, 2000)
 assert.ok(Math.abs(withTool.tps! - 100) < 1e-9) // 150 / 1500ms
 
+// 工具窗口为纯执行（tool-call 在参数流式生成完毕、解析后写入）——参数生成
+// 期无时间戳、留在净生成内，分子分母同含参数 token（口径一致）：150−0 / 1500ms
+const withParam = computePerfSample(
+  am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
+  [textPart(1500), toolPart(2000, 3000, "a".repeat(37))],
+)!
+assert.ok(Math.abs(withParam.tps! - 100) < 1e-9)
+
+// state.input 回退序列化：88 chars → 仍不扣除，150 / 1500ms
+const withInput = computePerfSample(
+  am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
+  [textPart(1500), { ...toolPart(2000, 3000), state: { status: "completed", time: { start: 2000, end: 3000 }, input: { content: "x".repeat(74) } } } as unknown as Part],
+)!
+assert.ok(Math.abs(withInput.tps! - 100) < 1e-9)
+
+// 真实流语义：参数在 [text.start, tool.start] 无时间戳段生成（不在工具窗口内），
+// 工具窗口 [2600,3000] 为纯执行 → genMs = 4000−1500−400 = 2100，150/2.1 ≈ 71.4
+const realWindow = computePerfSample(
+  am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
+  [textPart(1500), toolPart(2600, 3000, "a".repeat(37))],
+)!
+assert.equal(realWindow.ttft, 500)
+assert.equal(realWindow.latency, 2600)
+assert.ok(Math.abs(realWindow.tps! - 150 / 2.1) < 1e-9)
+
 // 并行重叠工具区间去重
 const overlapping = computePerfSample(
   am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
@@ -111,6 +136,23 @@ assert.equal(computePerfSample(am({ error: { name: "UnknownError", data: { messa
 assert.equal(computePerfSample(am({ tokens: { input: 10, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }), [textPart(1500)]), null)
 assert.equal(computePerfSample(am(), [toolPart(2000, 3000)]), null) // 无内容 part
 assert.equal(computePerfSample(am(), [textPart(1000)]), null) // firstStart <= created
+
+// 小步噪声守卫（genMs <500ms）：旧口径此类步虚高至 1500+，现 TPS 记 null（ttft/latency 保留）
+const tinyStep = computePerfSample(
+  am({ time: { created: 1000, completed: 1223 } }),
+  [textPart(1100), toolPart(1150, 1200)],
+)!
+assert.equal(tinyStep.tps, null)
+assert.equal(tinyStep.ttft, 100)
+assert.equal(tinyStep.latency, 173)
+
+// 参数远大于内容产出（如 write 大文档）：窗口=纯执行、参数生成期在净生成内，
+// 分子分母同含参数 → 样本有效且反映真实生成速率（不再因 visTok≤0 整条丢弃）
+const bigParam = computePerfSample(
+  am({ tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } }),
+  [textPart(1500), toolPart(2000, 3000, "a".repeat(37))],
+)!
+assert.ok(Math.abs(bigParam.tps! - 10) < 1e-9) // 5 tok / 500ms（默认完成为 3000）
 
 // ── aggregatePerf（侧边栏聚合，perf.ts 单一来源）───────────────────────────
 
