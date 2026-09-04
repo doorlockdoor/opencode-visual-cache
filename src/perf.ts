@@ -9,7 +9,7 @@ import { estimateTokens, num } from "./tokens"
 //            （体感口径：含 DB 写、工具注册解析、git 快照、HTTP 建连与重试等待等
 //             本地预处理开销，略大于 provider 报告的 TTFT）
 //   净生成 = time.completed − 首个 part start − 工具执行窗口∩生成区间
-//   TPS    = (output + reasoning) / 净生成 × 1000
+//   TPS    = (output + reasoning − 工具参数token) / 净生成 × 1000
 //            窗口从首个内容 part（含 reasoning）起算，覆盖思考+回答全程，
 //            分子须含思考 token——opencode 的 tokens.output 已被
 //            provider 侧扣除 reasoning（session.ts getUsage；Anthropic
@@ -24,20 +24,28 @@ import { estimateTokens, num } from "./tokens"
 //   3. 压缩（summary）消息与纯工具 step（无内容 part）不计入样本
 //   4. 小步噪声守卫（生成窗口 <500ms 时时间戳噪声占比过大，实测 50ms 级
 //      小步 TPS 虚高至 1500+）与缓冲网关守卫（<0.2ms/token，非流式瞬间
-//      吐出）触发时 TPS 记 null 而非输出虚高值，均值按有效子集计数
-//      （ttftN / tpsN），null 样本不稀释 tpsAvg
+//      吐出）触发时 TPS 记 null 而非输出虚高值，聚合按有效子集计数
+//      （ttftN / tpsN），null 样本不进入 tpsMed
 //   5. 采样逻辑单一实现 computePerfSample，侧边栏累计与 hint 栏 lastTps 共用
 //      （曾因 hint 栏独立副本漏加 reasoning 分子、漏扣工具区间，同屏差 4 倍）
-//   6. 工具窗口口径（1.18 AI SDK 流，源码验证）：state.time.start 打在
-//      tool-call 事件——参数 JSON 全部流式生成完毕并解析之后（processor.ts
-//      "tool-call" 分支），end 打在 tool-result——即 [start,end] 为纯工具执行
-//      窗口，参数生成期无时间戳标记、连同参数 token 一并留在净生成窗口内。
-//      故分子分母口径一致（output+reasoning 含工具参数、净生成含参数生成
-//      时长），参数产速与内容产速一致时测得值即真实生成速率；写大文档等
-//      参数密集 step 不再被分子扣除参数的偏差压低（此前曾按"窗口涵盖参数
-//      生成+执行"扣除参数 token——例：真速 30 tok/s 时 0.5K 说明 + 4K write
-//      参数读数仅约 3.3 tok/s，大参数 step 甚至因 visTok≤0 被整体丢弃，
-//      故推倒该口径）。
+//   6. 工具参数 token（estimateTokens(state.raw/input, "code")）从分子扣除。
+//      两段源码事实（1.18 AI SDK 流，opencode server 验证）：
+//      (a) tool part 的 state.time.start 打在 tool-call 事件（参数 JSON
+//          流式生成完毕并解析后，processor.ts），end 打在 tool-result——
+//          即 [start,end] 为纯工具执行窗口，参数流式生成期恰在窗口之外、
+//          无任何 part 时间戳标记；
+//      (b) 部分 provider 路由（实测 z-ai/glm-5.3-flash @ OpenRouter）把
+//          工具参数作为整块 chunk 一次性到达（tool-call 紧贴文本结束，无
+//          tool-input delta 时序）——参数 token 的大幅解码耗时并未反映在
+//          [fs, completed] 窗口中，仅 count 在 usage.output 里。
+//      两者叠加导致：分母已扣除执行窗口，却仍含"参数流式生成期"（a）或
+//      "参数整包瞬时到达"（b），而分子若保留参数 token 则带工具 step 显著
+//      虚高（本会话实测单步 431/227 tok/s，同期实时估算仅 48/28）。扣除参数
+//      token 后口径 = 流式可见 token 的生成速度，与实时估算（只扫
+//      text/reasoning 部分、工具相位不显示速度）一致；参数生成期被算入
+//      分母的时间残差对文本型 step 影响 <5%（参数占比小时自然衰减）。
+//      注（曾推倒又修正）：此前某版曾假设"窗口覆盖参数生成+执行"，据以将
+//      分子保留参数——与 (a)(b) 的实测时序不符，已按本款回退。
 // 状态驱动：消息与 part 的时间戳持久化在数据库中，直接响应式推导——
 // 历史会话与子代理会话自动生效，无需事件监听、缓存或文件日志。
 
@@ -78,6 +86,18 @@ export interface PerfSample {
   latency: number
 }
 
+/**
+ * 工具参数原文：优先 state.raw（模型生成的原始参数文本），回退 state.input 序列化。
+ * 与 dist.ts 扫描口径一致；序列化抛错（循环引用等）按空串处理。
+ */
+function toolParamText(p: Part): string {
+  const st = (p as { state?: { raw?: unknown; input?: unknown } }).state
+  try {
+    if (typeof st?.raw === "string" && st.raw) return st.raw
+    return st?.input != null ? JSON.stringify(st.input) : ""
+  } catch { return "" }
+}
+
 // ── 单条 assistant 消息的性能样本（精确口径唯一实现）──
 // 侧边栏「性能」累计与 hint 栏 lastTps 共用，杜绝双源漂移（历史上 hint 栏
 // 的独立副本漏加 reasoning 分子、漏扣工具区间，显示值差 4 倍以上）。
@@ -96,12 +116,13 @@ export function computePerfSample(
   const genTok = outputTok + reasoningTok
   if (genTok <= 0) return null
   // 首个内容 part (text/reasoning) 的开始时间 = 首 token 到达时刻，取最早值；
-  // 工具执行窗口 [start, end] 列表（completed/error 才有完整时间）。
-  // 窗口语义 = 纯执行（tool-call 事件在参数 JSON 流式生成完毕、解析后写入，
-  // tool-result 写 end），参数生成期无时间戳标记 → 保留在净生成窗口内；
-  // 故分子含参数 token、分母含参数生成时长（口径对齐，见头部修正点 6）
+  // 工具执行窗口 [start, end] 列表（completed/error 才有完整时间）；
+  // 工具参数 token 累计：state.time.start 打在参数流式生成完毕之后（tool-call
+  // 事件），且部分 router 参数整包瞬时到达——参数解码时长不可观测（见头部
+  // 修正点 6），分子扣除参数 token 以对齐"流式可见 token 速度"口径。
   let firstStart: number | undefined
   let toolIvs: [number, number][] | null = null
+  let paramTok = 0
   for (const p of parts) {
     if (p.type === "tool") {
       const tw = (p as any).state?.time
@@ -109,6 +130,8 @@ export function computePerfSample(
         toolIvs ??= []
         toolIvs.push([tw.start, tw.end])
       }
+      const raw = toolParamText(p)
+      if (raw) paramTok += estimateTokens(raw, "code")
       continue
     }
     if (p.type !== "text" && p.type !== "reasoning") continue
@@ -116,6 +139,9 @@ export function computePerfSample(
     if (typeof st === "number" && st > 0 && (firstStart === undefined || st < firstStart)) firstStart = st
   }
   if (firstStart === undefined || firstStart <= created) return null
+  // 参数 token 占满产出（write 大文档等纯参数 step 或估算偏差）：产出不可见
+  // token 为 0 → 匀速测算无意义，TPS 记 null（TTFT/延迟继续有效，见守卫注释）
+  const visTok = genTok - paramTok
   const fs = firstStart
   // 合并工具执行窗口（并行工具区间重叠），扣除与生成区间的交集。
   // 注意：这里钳位到 [fs, completed]，即首内容前的工具时间不参与扣减——
@@ -127,35 +153,48 @@ export function computePerfSample(
   const ttft = fs - created
   const genMs = Math.max(0, completed - fs - toolMs)
   const latency = Math.max(0, completed - created - toolMs)
-  // 守卫（小步噪声 + 缓冲网关）任一触发：TPS 记 null，ttft/latency 照常返回
-  const tps = genMs >= Math.max(MIN_GEN_MS, genTok * BUFFER_MS_PER_TOKEN) ? (genTok / genMs) * 1000 : null
+  // 守卫（小步噪声 + 缓冲网关 + 可见产出)任一触发：TPS 记 null，ttft/latency 照常返回
+  const tps = visTok > 0 && genMs >= Math.max(MIN_GEN_MS, visTok * BUFFER_MS_PER_TOKEN) ? (visTok / genMs) * 1000 : null
   return { ttft, tps, latency }
 }
 
 // ── 会话级性能聚合（侧边栏「性能」区消费）──
 // PerfStats 形状从 index.tsx 迁入：聚合与采样同属精确口径，单文件单来源，
 // 并可被 tests/perf.test.ts 直接单测（替代易漂移的手工镜像）。
+// 聚合用中位数而非均值：会话常跨模型/跨路由（均值被高速段与离群短步拉偏，
+// 实测单模型会话 44→52、多模型会话 30→37+），中位数与体感一致且抗离群；
+// 偶数样本取中间两值平均。数组随聚合重建（10Hz 节流下 O(n log n) 可忽略），
+// KV 快照只存聚合结果不存原始样本。
 export interface PerfStats {
   ttftLast: number | null // 最近一次首字延迟 (ms)
   tpsLast: number | null  // 最近一次输出速度 (tok/s)
   latLast: number | null  // 最近一次净模型延迟 (ms，已扣工具执行窗口)
-  ttftAvg: number | null  // 会话平均首字延迟 (ms)
-  tpsAvg: number | null   // 会话平均输出速度 (tok/s)
-  latAvg: number | null   // 会话平均净模型延迟 (ms)
+  ttftMed: number | null  // 会话首字延迟中位数 (ms)
+  tpsMed: number | null   // 会话输出速度中位数 (tok/s)
+  latMed: number | null   // 会话净模型延迟中位数 (ms)
   ttftN: number           // 有效样本数（TTFT/延迟共用；压缩消息与纯工具 step 不计）
-  tpsN: number            // TPS 有效样本数（缓冲网关守卫记 null 的样本不计入）
+  tpsN: number            // TPS 有效样本数（守卫记 null 的样本不计入）
   hasPerf: boolean        // 是否存在有效样本
 }
 
 export const EMPTY_PERF: PerfStats = {
   ttftLast: null, tpsLast: null, latLast: null,
-  ttftAvg: null, tpsAvg: null, latAvg: null,
+  ttftMed: null, tpsMed: null, latMed: null,
   ttftN: 0, tpsN: 0, hasPerf: false,
 }
 
-/** 遍历 assistant 消息逐条采样（computePerfSample 唯一口径），增量均值聚合为 PerfStats。 */
+/** 中位数：偶数个取中间两值平均。 */
+function median(values: readonly number[]): number {
+  const s = [...values].sort((a, b) => a - b)
+  const mid = s.length >> 1
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
+}
+
+/** 遍历 assistant 消息逐条采样（computePerfSample 唯一口径），聚合为中位数 PerfStats。 */
 export function aggregatePerf(api: TuiPluginApi, msgs: readonly Message[]): PerfStats {
-  const perf: PerfStats = { ...EMPTY_PERF }
+  const ttfts: number[] = []
+  const tpss: number[] = []
+  const lats: number[] = []
   for (const msg of msgs) {
     if (msg.role !== "assistant") continue
     const am = msg as AssistantMessage
@@ -163,19 +202,21 @@ export function aggregatePerf(api: TuiPluginApi, msgs: readonly Message[]): Perf
     try { parts = api.state.part(am.id) } catch {}
     const sample = computePerfSample(am, parts)
     if (!sample) continue
-    perf.ttftN++
-    perf.latLast = sample.latency
-    perf.latAvg = perf.latAvg === null ? sample.latency : perf.latAvg + (sample.latency - perf.latAvg) / perf.ttftN
-    perf.ttftLast = sample.ttft
-    perf.ttftAvg = perf.ttftAvg === null ? sample.ttft : perf.ttftAvg + (sample.ttft - perf.ttftAvg) / perf.ttftN
-    if (sample.tps !== null) {
-      perf.tpsN++
-      perf.tpsLast = sample.tps
-      perf.tpsAvg = perf.tpsAvg === null ? sample.tps : perf.tpsAvg + (sample.tps - perf.tpsAvg) / perf.tpsN
-    }
-    perf.hasPerf = true
+    ttfts.push(sample.ttft)
+    lats.push(sample.latency)
+    if (sample.tps !== null) tpss.push(sample.tps)
   }
-  return perf
+  return {
+    ttftLast: ttfts.length ? ttfts[ttfts.length - 1] : null,
+    tpsLast: tpss.length ? tpss[tpss.length - 1] : null,
+    latLast: lats.length ? lats[lats.length - 1] : null,
+    ttftMed: ttfts.length ? median(ttfts) : null,
+    tpsMed: tpss.length ? median(tpss) : null,
+    latMed: lats.length ? median(lats) : null,
+    ttftN: ttfts.length,
+    tpsN: tpss.length,
+    hasPerf: ttfts.length > 0,
+  }
 }
 
 // ── live (streaming) perf estimation ──

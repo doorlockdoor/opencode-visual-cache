@@ -966,14 +966,14 @@ function TokenCachePanel(props: {
   }
 
   // ── performance section rows ──
-  // 每行 "标签: 最近值 (均 均值)"，仅精确口径（请求结束后随精确数据刷新，
-  // 与面板其他数据行为统一）；面板过窄放不下均值段时自动省略，
+  // 每行 "标签: 最近值 (中 中位数)"，仅精确口径（请求结束后随精确数据刷新，
+  // 与面板其他数据行为统一）；面板过窄放不下中位段时自动省略，
   // 保证标签与最近值始终完整显示。
-  const perfRow = (label: string, lastStr: string, avgStr: string | null): string => {
+  const perfRow = (label: string, lastStr: string, medStr: string | null): string => {
     const gauge = panelWidth() - gutter()
     let value = lastStr
-    if (avgStr) {
-      const suffix = " (" + avgStr + ")"
+    if (medStr) {
+      const suffix = " (" + medStr + ")"
       if (visualWidth(label) + visualWidth(lastStr + suffix) + 1 <= gauge) {
         value = lastStr + suffix
       }
@@ -986,7 +986,7 @@ function TokenCachePanel(props: {
     const p = data().perf
     if (p.latLast === null) return null
     return perfRow(t("perfLat"), fmtMs(p.latLast),
-      p.latAvg !== null ? t("perfAvg", { v: fmtMs(p.latAvg) }) : null)
+      p.latMed !== null ? t("perfAvg", { v: fmtMs(p.latMed) }) : null)
   })
 
   const perfRows = createMemo<string[]>(() => {
@@ -995,11 +995,11 @@ function TokenCachePanel(props: {
     const rows: string[] = []
     if (p.ttftLast !== null) {
       rows.push(perfRow(t("perfTTFT"), fmtMs(p.ttftLast),
-        p.ttftAvg !== null ? t("perfAvg", { v: fmtMs(p.ttftAvg) }) : null))
+        p.ttftMed !== null ? t("perfAvg", { v: fmtMs(p.ttftMed) }) : null))
     }
     if (p.tpsLast !== null) {
       rows.push(perfRow(t("perfTPS"), p.tpsLast.toFixed(1) + " " + t("tokS"),
-        p.tpsAvg !== null ? t("perfAvg", { v: p.tpsAvg.toFixed(1) }) : null))
+        p.tpsMed !== null ? t("perfAvg", { v: p.tpsMed.toFixed(1) }) : null))
     }
     const lr = latRow()
     if (lr) rows.push(lr)

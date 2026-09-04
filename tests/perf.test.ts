@@ -89,30 +89,29 @@ assert.equal(withTool.ttft, 500)
 assert.equal(withTool.latency, 2000)
 assert.ok(Math.abs(withTool.tps! - 100) < 1e-9) // 150 / 1500ms
 
-// 工具窗口为纯执行（tool-call 在参数流式生成完毕、解析后写入）——参数生成
-// 期无时间戳、留在净生成内，分子分母同含参数 token（口径一致）：150−0 / 1500ms
+// 分子扣除工具参数 token（state.raw 37 ASCII → code 档 10 tok）：150−10=140 / 1500ms
 const withParam = computePerfSample(
   am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
   [textPart(1500), toolPart(2000, 3000, "a".repeat(37))],
 )!
-assert.ok(Math.abs(withParam.tps! - 100) < 1e-9)
+assert.ok(Math.abs(withParam.tps! - 140 / 1.5) < 1e-9)
 
-// state.input 回退序列化：88 chars → 仍不扣除，150 / 1500ms
+// state.input 回退序列化：{"content":"x"*74} 88 chars → ceil(88/3.7)=24 tok → 126/1500ms
 const withInput = computePerfSample(
   am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
   [textPart(1500), { ...toolPart(2000, 3000), state: { status: "completed", time: { start: 2000, end: 3000 }, input: { content: "x".repeat(74) } } } as unknown as Part],
 )!
-assert.ok(Math.abs(withInput.tps! - 100) < 1e-9)
+assert.ok(Math.abs(withInput.tps! - 126 / 1.5) < 1e-9)
 
 // 真实流语义：参数在 [text.start, tool.start] 无时间戳段生成（不在工具窗口内），
-// 工具窗口 [2600,3000] 为纯执行 → genMs = 4000−1500−400 = 2100，150/2.1 ≈ 71.4
+// 工具窗口 [2600,3000] 为纯执行 → genMs = 4000−1500−400 = 2100；(150−10)/2.1 ≈ 66.7
 const realWindow = computePerfSample(
   am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
   [textPart(1500), toolPart(2600, 3000, "a".repeat(37))],
 )!
 assert.equal(realWindow.ttft, 500)
 assert.equal(realWindow.latency, 2600)
-assert.ok(Math.abs(realWindow.tps! - 150 / 2.1) < 1e-9)
+assert.ok(Math.abs(realWindow.tps! - 140 / 2.1) < 1e-9)
 
 // 并行重叠工具区间去重
 const overlapping = computePerfSample(
@@ -146,17 +145,19 @@ assert.equal(tinyStep.tps, null)
 assert.equal(tinyStep.ttft, 100)
 assert.equal(tinyStep.latency, 173)
 
-// 参数远大于内容产出（如 write 大文档）：窗口=纯执行、参数生成期在净生成内，
-// 分子分母同含参数 → 样本有效且反映真实生成速率（不再因 visTok≤0 整条丢弃）
+// 参数远大于内容产出（如 write 大文档）：分子扣除后 visTok ≤ 0 → TPS 记 null；
+// 样本保留（TTFT/延迟照常有效，不被稀释进均值）
 const bigParam = computePerfSample(
   am({ tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } }),
   [textPart(1500), toolPart(2000, 3000, "a".repeat(37))],
 )!
-assert.ok(Math.abs(bigParam.tps! - 10) < 1e-9) // 5 tok / 500ms（默认完成为 3000）
+assert.equal(bigParam.tps, null)
+assert.equal(bigParam.ttft, 500)
+assert.equal(bigParam.latency, 1000) // 3000−1000−1000
 
 // ── aggregatePerf（侧边栏聚合，perf.ts 单一来源）───────────────────────────
 
-// 两条有效样本 → 子集均值
+// 两条有效样本 → 中位数（偶数取中间两值平均）
 {
   const m1 = am() // ttft 500 / tps 66.7 / lat 2000
   const m2 = am({ id: "m2", time: { created: 5000, completed: 6000 }, tokens: { input: 5, output: 200, reasoning: 0, cache: { read: 0, write: 0 } } })
@@ -166,15 +167,34 @@ assert.ok(Math.abs(bigParam.tps! - 10) < 1e-9) // 5 tok / 500ms（默认完成�
   })
   const perf = aggregatePerf(api, [m1, m2] as unknown as Message[])
   assert.equal(perf.ttftN, 2)
-  assert.equal(perf.ttftAvg, 500)
+  assert.equal(perf.ttftMed, 500)
   assert.equal(perf.tpsN, 2)
-  assert.ok(Math.abs(perf.tpsAvg! - (100 / 1.5 + 400) / 2) < 1e-9) // m2: 200 tok / 500ms
+  assert.ok(Math.abs(perf.tpsMed! - (100 / 1.5 + 400) / 2) < 1e-9) // m2: 200 tok / 500ms
   assert.equal(perf.tpsLast, 400)
   assert.equal(perf.latLast, 1000)
   assert.equal(perf.hasPerf, true)
 }
 
-// 压缩/纯工具不计入；缓冲网关守卫只剔除 tps，不稀释均值
+// 三条样本 → 中位数 ≠ 均值（200/400/1800 → 中位 400，均值 800）
+{
+  const msgs = [
+    am({ id: "a", time: { created: 1000, completed: 1600 }, tokens: { input: 1, output: 100, reasoning: 0, cache: { read: 0, write: 0 } } }),
+    am({ id: "b", time: { created: 2000, completed: 2600 }, tokens: { input: 1, output: 200, reasoning: 0, cache: { read: 0, write: 0 } } }),
+    am({ id: "c", time: { created: 3000, completed: 3600 }, tokens: { input: 1, output: 900, reasoning: 0, cache: { read: 0, write: 0 } } }),
+  ]
+  const api = makeApi({
+    messages: () => [],
+    parts: (mid) => [textPart(mid === "a" ? 1100 : mid === "b" ? 2100 : 3100)],
+  })
+  const perf = aggregatePerf(api, msgs as unknown as Message[])
+  // 各步生成窗口均 500ms（≥MIN_GEN_MS）→ a:200 / b:400 / c:1800 tok/s
+  assert.equal(perf.tpsN, 3)
+  assert.equal(perf.tpsMed, 400) // 中位数
+  assert.ok(Math.abs(perf.tpsLast! - 1800) < 1e-9)
+  assert.equal(perf.ttftMed, 100) // 三条 ttft 均 100
+}
+
+// 压缩/纯工具不计入；守卫只剔除 tps，不进入中位数
 {
   const valid = am()
   const skipped = am({ id: "m2", summary: true })
@@ -186,7 +206,7 @@ assert.ok(Math.abs(bigParam.tps! - 10) < 1e-9) // 5 tok / 500ms（默认完成�
   const perf = aggregatePerf(api, [valid, skipped, buffered] as unknown as Message[])
   assert.equal(perf.ttftN, 2) // summary 不计；buffered 仍计 ttft/latency
   assert.equal(perf.tpsN, 1) // buffered 的 tps 为 null，不计入
-  assert.ok(Math.abs(perf.tpsAvg! - 100 / 1.5) < 1e-9)
+  assert.ok(Math.abs(perf.tpsMed! - 100 / 1.5) < 1e-9)
   assert.equal(perf.ttftLast, 1)
   assert.equal(perf.hasPerf, true)
 }
