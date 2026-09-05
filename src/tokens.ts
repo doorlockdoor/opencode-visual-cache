@@ -15,7 +15,7 @@ export function num(v: unknown): number {
 //   ASCII 代码/JSON：~3.7 字符/token（DS-V4 3.71 / o200k 3.92）
 //   假名/谚文：~1.0 字/token
 // 不同 part 形态的真实密度差异显著（同模型：答案段 ascii 2.97 vs 思考段 4.04），
-// 故以 profile 参数区分：估计 tokens 时按 part 形态传入 profile（省略参数走
+// 故以 profile 参数区分：估算 tokens 时按 part 形态传 profile（省略参数走
 // default 检测路径）。default 保留 jsonLike/codeLike 检测（JSON/源码几乎每个
 // 标点独立 token，需收紧）。
 // See: GPT-4 / Claude tokenizer behaviour with structured text.
@@ -23,7 +23,7 @@ export function num(v: unknown): number {
 export type TokProfile = "thinking" | "answer" | "code"
 
 const ASCII_PER_TOKEN: Record<TokProfile, number> = {
-  thinking: 4.0, // reasoning part：95% ascii 思考流（实测密度 4.04）
+  thinking: 4.0, // reasoning part：~95% ascii 思考流（实测密度 4.04）
   answer: 2.9,   // text part：符号/代码片段密集的答案（实测 2.97，含全角/符号稀释）
   code: 3.7,     // tool raw/output：纯代码/命令输出（实测密度 3.71）
 }

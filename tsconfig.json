@@ -6,7 +6,6 @@
     "jsx": "react-jsx",
     "jsxImportSource": "@opentui/solid",
     "strict": true,
-    "types": ["node"],
     "outDir": "dist",
     "rootDir": "src",
     "declaration": true,

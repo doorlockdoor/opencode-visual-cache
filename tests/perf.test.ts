@@ -89,29 +89,29 @@ assert.equal(withTool.ttft, 500)
 assert.equal(withTool.latency, 2000)
 assert.ok(Math.abs(withTool.tps! - 100) < 1e-9) // 150 / 1500ms
 
-// 分子扣除工具参数 token（state.raw 37 ASCII → code 档 10 tok）：150−10=140 / 1500ms
+// 全量口径：工具参数不再从分子扣除（output 含 tool_use 参数 JSON；150 tok / 1500ms）
 const withParam = computePerfSample(
   am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
   [textPart(1500), toolPart(2000, 3000, "a".repeat(37))],
 )!
-assert.ok(Math.abs(withParam.tps! - 140 / 1.5) < 1e-9)
+assert.ok(Math.abs(withParam.tps! - 150 / 1.5) < 1e-9)
 
-// state.input 回退序列化：{"content":"x"*74} 88 chars → ceil(88/3.7)=24 tok → 126/1500ms
+// 参数经 state.input 序列化存在时同样不影响分子（150 / 1500ms）
 const withInput = computePerfSample(
   am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
   [textPart(1500), { ...toolPart(2000, 3000), state: { status: "completed", time: { start: 2000, end: 3000 }, input: { content: "x".repeat(74) } } } as unknown as Part],
 )!
-assert.ok(Math.abs(withInput.tps! - 126 / 1.5) < 1e-9)
+assert.ok(Math.abs(withInput.tps! - 150 / 1.5) < 1e-9)
 
 // 真实流语义：参数在 [text.start, tool.start] 无时间戳段生成（不在工具窗口内），
-// 工具窗口 [2600,3000] 为纯执行 → genMs = 4000−1500−400 = 2100；(150−10)/2.1 ≈ 66.7
+// 工具窗口 [2600,3000] 为纯执行 → genMs = 4000−1500−400 = 2100；150 / 2.1 ≈ 71.4
 const realWindow = computePerfSample(
   am({ time: { created: 1000, completed: 4000 }, tokens: { input: 10, output: 150, reasoning: 0, cache: { read: 0, write: 0 } } }),
   [textPart(1500), toolPart(2600, 3000, "a".repeat(37))],
 )!
 assert.equal(realWindow.ttft, 500)
 assert.equal(realWindow.latency, 2600)
-assert.ok(Math.abs(realWindow.tps! - 140 / 2.1) < 1e-9)
+assert.ok(Math.abs(realWindow.tps! - 150 / 2.1) < 1e-9)
 
 // 并行重叠工具区间去重
 const overlapping = computePerfSample(
@@ -145,13 +145,14 @@ assert.equal(tinyStep.tps, null)
 assert.equal(tinyStep.ttft, 100)
 assert.equal(tinyStep.latency, 173)
 
-// 参数远大于内容产出（如 write 大文档）：分子扣除后 visTok ≤ 0 → TPS 记 null；
-// 样本保留（TTFT/延迟照常有效，不被稀释进均值）
+// 参数远大于内容产出（如 write 大文档）：全量口径下分子为供应商精确值
+// （5 tok），工具窗口已扣 → genMs 500ms，TPS 正常给出（10 tok/s），
+// 不再因"可见产出为 0"而降级为 null
 const bigParam = computePerfSample(
   am({ tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } }),
   [textPart(1500), toolPart(2000, 3000, "a".repeat(37))],
 )!
-assert.equal(bigParam.tps, null)
+assert.equal(bigParam.tps, 10)
 assert.equal(bigParam.ttft, 500)
 assert.equal(bigParam.latency, 1000) // 3000−1000−1000
 

@@ -3,16 +3,15 @@ import type { AssistantMessage, Message, UserMessage } from "@opencode-ai/sdk"
 import type { Part } from "@opencode-ai/sdk/v2"
 import { estimateTokens, num } from "./tokens"
 
-// ── token 分布扫描（侧边栏「分布」区数据源）──
-// 纯函数：api.state store 读取不建立响应式依赖，调用方须在 untrack 内调用。
+// ── token distribution scan ──
+// 侧边栏「分布」区数据源。纯函数：api.state store 读取不建立响应式依赖，
+// 调用方须在 untrack 内调用。
 //
-// per-message 小计缓存：流式期间仅尾消息的 parts 在增长，而全量重扫
-// （estimateTokens 逐字符，1MB≈5-10ms）过去随事件频率重跑成为 CPU 热点。
-// 以「消息 id → 指纹+小计」缓存后，重建只需对每条消息计算 O(1) 字段指纹
-// （不扫字符），未变化的消息直接复用小计，实际扫描收敛到真正变化的消息。
-// 指纹覆盖所有被扫描字段的长度与状态（长度 O(1)），任一变化即失效；
-// 消息 id 全局唯一，跨会话/override 无串扰；条目超上限全清防泄漏。
-// 性能验证与收益量化见 benchmarks/dist-bench.mts（npm run bench:dist）。
+// per-message 小计缓存：流式期间仅尾消息的 parts 在增长，全量重扫
+// （estimateTokens 逐字符）过去随事件频率重跑成为 CPU 热点。以
+// 「消息 id → 指纹+小计」缓存后，重建只需计算 O(1) 字段指纹；指纹覆盖
+// 所有被扫描字段的长度与状态，任一变化即失效；条目超上限全清防泄漏。
+// 性能验证见 benchmarks/dist-bench.mts（npm run bench:dist）。
 
 export interface TokenDist {
   system: number   // UserMessage.system + agent config prompt
@@ -29,7 +28,7 @@ export interface TokenDist {
 }
 
 /** SDK 未就绪/越界时返回空 parts（逐条 try/catch 的公共形态） */
-export function partsOf(api: TuiPluginApi, id: string): readonly Part[] {
+function partsOf(api: TuiPluginApi, id: string): readonly Part[] {
   try { return api.state.part(id) } catch { return [] }
 }
 
@@ -75,7 +74,7 @@ export function collectRoundUsage(api: TuiPluginApi, msgs: Message[]): {
   return { apiInput, apiOutput, stepCount, stepCost: lastCost ?? 0 }
 }
 
-// ── 单消息 dist 小计 + 指纹缓存 ──
+// ── per-message dist subtotal + fingerprint cache ──
 
 interface DistSub {
   system: number; user: number; agent: number; toolCall: number; toolResult: number

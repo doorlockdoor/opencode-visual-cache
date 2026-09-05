@@ -226,18 +226,15 @@ function fmtMs(ms: number): string {
   return (ms / 1000).toFixed(1) + "s"
 }
 
-// ── token 分布 / 性能聚合 ──
+// ── dist / perf aggregation ──
 // TokenDist 与收集函数（collectTokenDist/collectRoundUsage，含 per-message
 // 指纹缓存）见 ./dist.ts；PerfStats / aggregatePerf 见 ./perf.ts。
 // 两者均为纯统计（不建立响应式依赖），调用方须在 untrack 内调用。
 
-// 流式活跃期间的 250ms 心跳：part 事件只随 delta 到达，长时间无增量（深度思考、
-// 缓冲网关、step 间隙）时由心跳推动时钟前进；空闲时 interval 不存在，零常驻开销。
-// api.state 是宿主暴露的响应式 Solid store（adapters.tsx 直接透传 sync.data，
-// createStore 实现）：活跃判定优先读 session.status（busy 覆盖工具执行、
-// step 间 gap、下一步 prefill 全程——与 computeLivePerf 的工具回合延续窗口
-// 对齐，仅读消息状态会在"上一步 completed → 下一条未创建"的间隙停摆）；
-// status API 不可用时回退到消息判定（最后一条 assistant 未完成）。
+// 流式活跃期限的 250ms 心跳：part 事件只随 delta 到达，长时间无增量（思考、
+// 缓冲、step 间隙）时由心跳推动时钟；空闲时不建 interval，零常驻开销。
+// 活跃判定优先读 session.status（busy 覆盖工具执行与 step 间隙全程），
+// API 不可用时回退到消息判定（最后一条 assistant 未完成）。
 // 返回 signal getter——在 memo 中读取它以建立 250ms 重算依赖。
 function createBusyTick(api: TuiPluginApi, sid: () => string): () => number {
   const [tick, setTick] = createSignal(0)
@@ -266,10 +263,9 @@ function createBusyTick(api: TuiPluginApi, sid: () => string): () => number {
 type StatSeg = { text: string; color: string | undefined }
 type Translate = ReturnType<typeof createT>
 
-// 流式实时估算的着色分段（PromptRightStatus 输入框行右侧实时显示专用；
-// 侧边栏「性能」区为纯精确口径，无实时行）：
-// prefill → 首字 等待中；streaming → 首字(精确) · 速度(≈，守卫未达则省略)；
-// tool → 工具 计时中（速度段隐藏）。
+// 流式实时估算的着色分段（PromptRightStatus 专用；侧边栏「性能」为精确口径，
+// 无实时行）：prefill → 首字等待中；streaming → 首字 · 速度(≈，未达守卫则省略)；
+// tool → 工具计时中（速度段隐藏）。
 function liveStatSegs(lv: LivePerf, t: Translate, muted: string | undefined, text: string | undefined): StatSeg[] {
   if (lv.phase === "tool") {
     return [
@@ -498,8 +494,7 @@ const DEFAULT_RATES: Record<string, number> = {
 }
 
 const MIN_PANEL_WIDTH = 20
-// part 事件 → data effect 重算的节流间隔（前沿+尾沿）：重算上限 10Hz，
-// 数值更新延迟最多 +100ms；与旧 debounce 同值
+// part 事件 → data 重算的节流间隔（前沿+尾沿）：重算上限 10Hz，延迟 ≤100ms
 const PART_THROTTLE_MS = 100
 const DEFAULT_PANEL_WIDTH = 26
 
@@ -602,12 +597,11 @@ function TokenCachePanel(props: {
   const [lastHasDist, setLastHasDist] = createSignal(false)
 
   // ── performance snapshot ──────────────────────────────────────
-  // 与 dist 相同的防闪烁策略：api.state.part() 在视图切换后重新水合前，
-  // hasPerf 会短暂翻转为 false；保留最近一次有效性能聚合（含跨重挂载的
-  // KV 快照）让 UI 保持稳定，直到下一次成功计算到来。
+  // 与 dist 相同的防闪烁策略：part() 重新水合前 hasPerf 短暂翻 false；
+  // 保留最近有效性能聚合与 KV 快照让 UI 稳定；lastPerfModelKey 记录快照的
+  // 过滤上下文（null=全局，模型切换后旧快照不复用）。
   const [lastPerf, setLastPerf] = createSignal<PerfStats>({ ...EMPTY_PERF })
   const [lastHasPerf, setLastHasPerf] = createSignal(false)
-  // 最近有效性能快照的过滤上下文（perfCtx，""=全局；模型切换后不匹配则不回退）
   const [lastPerfModelKey, setLastPerfModelKey] = createSignal<string | null>(null)
 
   const [dataSignal, setDataSignal] = createSignal<any>({
@@ -680,10 +674,9 @@ function TokenCachePanel(props: {
 
   createEffect(() => {
     const sid = props.signals.overrideSessionId() ?? props.sessionId
-    // 双通道驱动：partVersion（part/msg 事件，100ms 节流）承担高频 part 增量；
-    // refreshTick（仅 session.updated）承担 session 级变化（聚合 tokens/model
-    // 切换），step 级频率即时生效。重算成本已由 dist.ts 的指纹缓存摊平，
-    // 但节流仍是第一道闸（聚合循环本身 O(消息数) 也不必跑在事件频率上）。
+    // 双通道驱动：partVersion（part/消息事件）承担高频增量；refreshTick（仅
+    // session.updated）承担 session 级聚合变化。重算成本已由 dist.ts 指纹缓存
+    // 摊平，但节流仍是第一道闸（聚合循环本身 O(消息数)，不必跑在事件频率上）。
     void refreshTick()
     void partVersion()
 
@@ -693,9 +686,8 @@ function TokenCachePanel(props: {
       ? props.api.state.session.get(sid)
       : undefined
 
-    // 性能过滤：开关在 effect 外读取（响应式，切换即重算）；上下文键为
-    // 当前模型指纹，空串表示全局不过滤（含开关开启但模型不可知的退化）。
-    // 聚合在 untrack 内读取 currentModelKey（session/messages 已在外层追踪）。
+    // 性能过滤：开关在 effect 外读取（响应式，切换即重算）；上下文键为当前
+    // 模型指纹，空串表示全局不过滤（含开关开启但模型不可知的退化）。
     const perfFilterOn = props.signals.perfModelFilter()
     const perfCtxKey = perfFilterOn ? (currentModelKey(props.api, sid) ?? "") : ""
 
@@ -744,16 +736,15 @@ function TokenCachePanel(props: {
     const hasTrendData = prevMsgHitRate >= 0 && lastMsgHitRate >= 0
     const trend = hasTrendData ? lastMsgHitRate - prevMsgHitRate : 0, providerName = pid || ""
 
-    // untrack 只包裹已知触发死锁的 API；分布/性能聚合已抽为纯函数
-    // （collectTokenDist / aggregatePerf），lastDist/lastPerf 回退同样只在
-    // untrack 内读取（避免响应式依赖成环）
+    // untrack 只包裹已知触发死锁的 API；分布/性能聚合已抽为纯函数，回退快照
+    // 同样只在 untrack 内读取（避免响应式依赖成环）。
     const distData = untrack(() => {
       try {
         const { dist, hasDistData, skills } = collectTokenDist(props.api, msgs, session)
         const perf = aggregatePerf(props.api, msgs, { modelKey: perfCtxKey || undefined })
-        // 过滤上下文决定了哪些"最近有效快照"可回退：模型切换后上下文变化，
-        // 旧快照不再复用（否则会显示其他模型的陈旧统计）；上下文一致时
-        // （part() 重新水合等瞬态）照旧保持面板稳定。perfCtxKey ""=全局。
+        // 回退快照的有效性取决于过滤上下文：上下文一致时（part() 重新水合等
+        // 瞬态）沿用最近有效快照保持面板稳定；模型切换后上下文变化即不复用。
+        // perfCtxKey ""=全局（null 键）。
         const snapKey = perfCtxKey || null
         const fallbackOk = perf.hasPerf || (lastPerfModelKey() === snapKey && lastHasPerf())
         return {
@@ -794,8 +785,7 @@ function TokenCachePanel(props: {
 
   // Persist the last valid distribution so that data() can fall back
   // to it while api.state.part() is re-hydrating after a view switch.
-  // 浅比较去重：流式期间 data 高频重算但内容多数不变，跳过无变化的
-  // 信号写入与 KV 快照（lastDist 读取在 untrack 内，避免依赖成环）。
+  // 浅比较去重：内容多数不变时跳过信号写入与 KV 快照（lastDist 读取在 untrack 内）。
   createEffect(() => {
     const d = data()
     if (d.hasDistData && !untrack(() => shallowEqual(lastDist(), d.dist))) {
@@ -918,12 +908,9 @@ function TokenCachePanel(props: {
       pollRestore()
     }
 
-    // part/msg 事件 → partVersion（前沿+尾沿节流，间隔 PART_THROTTLE_MS）：
-    // 突发流式期间重算钳到 ≤10Hz，首事件立即生效（step completed 的精确值
-    // 落地时机不变）。旧实现为纯尾沿去抖，连续 delta 流下定时器不断重置会
-    // 饿死，故曾依赖 refreshTick 按事件频率重跑兜底——节流后 data effect
-    // 只跟 partVersion；refreshTick 仅由 session.updated 驱动（session 聚合
-    // tokens/model 变化即时生效，step 级频率，不构成热点）。
+    // part/msg 事件 → partVersion（前沿+尾沿节流 100ms）：突发流式期间重算
+    // 钳到 ≤10Hz，首事件立即生效；refreshTick 仅由 session.updated 驱动
+    // （session 聚合 tokens/model 变化，step 级频率，不构成热点）。
     const bumper = createThrottledBumper(() => setPartVersion((v) => v + 1), PART_THROTTLE_MS)
     const unsubPart = props.api.event.on("message.part.updated", bumper.bump)
     const unsubMsg = props.api.event.on("message.updated", bumper.bump)
@@ -993,10 +980,9 @@ function TokenCachePanel(props: {
     return label + " ".repeat(gap) + value + (unit ? " " + unit : "")
   }
 
-  // ── performance section rows ──
-  // 每行 "标签: 最近值 (中 中位数)"，仅精确口径（请求结束后随精确数据刷新，
-  // 与面板其他数据行为统一）；面板过窄放不下中位段时自动省略，
-  // 保证标签与最近值始终完整显示。
+  // ── performance rows ──
+  // 每行 "标签: 最近值 (中 中位数)"，仅精确口径（请求结束后随精确数据刷新）；
+  // 面板过窄放不下中位段时自动省略，保证标签与最近值始终完整显示。
   const perfRow = (label: string, lastStr: string, medStr: string | null): string => {
     const gauge = panelWidth() - gutter()
     let value = lastStr
@@ -1426,11 +1412,9 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
     return { hitRate, prevHitRate }
   })
 
-  // ── 最近一次 TPS（与侧边栏「性能」严格同源）──
-  // 从后往前找最近一条能产出有效性能样本的 assistant 消息，取其 TPS。
-  // 采样逻辑走 computePerfSample 唯一实现（含 output+reasoning 分子、
-  // 工具区间扣除与缓冲网关守卫）；样本 TPS 为 null（缓冲网关）或无样本 → null。
-  // 性能过滤开启时跳过非当前模型的样本，切换模型后不再显示旧模型的速度。
+  // ── last TPS (same source as sidebar) ──
+  // 从后往前找最近一条能产出有效性能样本的 assistant 消息，采样走
+  // computePerfSample 唯一实现；性能过滤开启时跳过非当前模型样本。
   const lastTps = createMemo(() => {
     const id = sid
     if (!id) return null
@@ -1536,13 +1520,11 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
   })
 
   // 统计部分分段（单一数据源）：量宽拼接 text，渲染逐段着色，避免双源漂移。
-  // 仅精确口径（命中率 + 趋势 + TPS）：宿主 Prompt 在 busy 时把 hint 行整体
-  // 替换为忙碌指示行（Switch 分支，组件随之卸载），流式实时估算因此放在
-  // 输入框行右侧（PromptRightStatus，session_prompt_right 插槽）。
-  const statsSegs = createMemo<{ text: string; color: string | undefined }[]>(() => {
+  // 仅精确口径（命中率 + 趋势 + TPS）；流式实时估算在输入框行右侧显示。
+  const statsSegs = createMemo<StatSeg[]>(() => {
     const s = stats()
     const hr = s && s.hitRate >= 0 ? (Math.floor(s.hitRate * 10) / 10).toFixed(1) + "%" : "--"
-    const segs: { text: string; color: string | undefined }[] = [
+    const segs: StatSeg[] = [
       { text: t("barHit") + " ", color: pal().muted },
       { text: hr, color: hitColor() },
     ]
@@ -1658,10 +1640,8 @@ function BottomStatusBar(props: { api: TuiPluginApi; signals: PanelSignals; sess
 
 /**
  * 输入框行右侧（session_prompt_right 插槽）：流式期间显示实时 首字/速度。
- * 宿主 Prompt 在会话 busy 时把底部 hint 行整体替换为忙碌指示行（Switch 分支，
- * 该行无插槽可注入），而输入框行右侧不受 status 控制、流式期间仍挂载——
- * 是 hint 之外唯一能实时显示的位置。空闲时回落为宿主 session_prompt_right
- * 透传（oc-tps 等其他插件在该插槽的显示不受影响）。
+ * 宿主在 busy 时会把底部 hint 行整体替换为忙碌指示行（无插槽可注入），而
+ * 输入框行右侧不受 status 控制；空闲时回落为宿主该插槽的透传（不遮挡其他插件）。
  */
 function PromptRightStatus(props: { api: TuiPluginApi; signals: PanelSignals; sessionId: string }): JSX.Element {
   const sid = props.sessionId
@@ -1801,10 +1781,8 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
             onSubmit={input.on_submit}
             ref={input.ref}
             hint={<BottomStatusBar api={api} signals={signals} sessionId={input.session_id} />}
-            // 接管 session_prompt 后需透传宿主的 session_prompt_right 插槽，
-            // 否则 oc-tps 等依赖该插槽的插件无法显示；无注册时 Slot 为 null。
-            // 流式期间（busy）宿主把 hint 行替换为忙碌指示行，实时 首字/速度
-            // 改由输入框行右侧的 PromptRightStatus 显示，空闲时其内部透传宿主 Slot。
+            // 透传宿主的 session_prompt_right 插槽（流式实时显示用），避免遮挡
+            // 依赖该插槽的其他插件；无注册时 Slot 为 null。
             right={<PromptRightStatus api={api} signals={signals} sessionId={input.session_id} />}
           />
         )
