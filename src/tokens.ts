@@ -22,7 +22,7 @@ export function num(v: unknown): number {
 
 export type TokProfile = "thinking" | "answer" | "code"
 
-const ASCII_PER_TOKEN: Record<TokProfile, number> = {
+export const ASCII_PER_TOKEN: Record<TokProfile, number> = {
   thinking: 4.0, // reasoning part：~95% ascii 思考流（实测密度 4.04）
   answer: 2.9,   // text part：符号/代码片段密集的答案（实测 2.97，含全角/符号稀释）
   code: 3.7,     // tool raw/output：纯代码/命令输出（实测密度 3.71）

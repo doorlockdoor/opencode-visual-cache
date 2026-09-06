@@ -49,8 +49,8 @@ function am(overrides: Record<string, unknown> = {}): AssistantMessage {
   } as unknown as AssistantMessage
 }
 
-function textPart(start: number, text = "x"): Part {
-  return { id: "t", sessionID: "s1", messageID: "m1", type: "text", text, time: { start } } as unknown as Part
+function textPart(start: number, text = "x", end?: number): Part {
+  return { id: "t", sessionID: "s1", messageID: "m1", type: "text", text, time: { start, ...(end !== undefined ? { end } : {}) } } as unknown as Part
 }
 
 function reasoningPart(start: number, text = "x"): Part {
@@ -76,9 +76,50 @@ assert.equal(basic.ttft, 500)
 assert.equal(basic.latency, 2000)
 assert.ok(Math.abs(basic.tps! - 100 / 1.5) < 1e-9) // 100 tok / 1500ms × 1000
 
-// 分子含 reasoning
-const withReasoning = computePerfSample(am({ tokens: { input: 10, output: 100, reasoning: 50, cache: { read: 0, write: 0 } } }), [textPart(1500)])!
+// 分子含 reasoning（有流式 reasoning part → 思考 token 计入）
+const withReasoning = computePerfSample(
+  am({ tokens: { input: 10, output: 100, reasoning: 50, cache: { read: 0, write: 0 } } }),
+  [reasoningPart(1500), textPart(1500)],
+)!
 assert.ok(Math.abs(withReasoning.tps! - 100) < 1e-9) // 150 tok / 1500ms
+
+// 隐藏思考（usage 计入 reasoningTokens 但无流式 reasoning part，如 chat-completions
+// o 系）：思考解码时间不可观测、分母从首个 text part 起算 → 分子退回 output，
+// 否则 (100+3000)/1.5 数量级虚高
+const hiddenReasoning = computePerfSample(
+  am({ tokens: { input: 10, output: 100, reasoning: 3000, cache: { read: 0, write: 0 } } }),
+  [textPart(1500)],
+)!
+assert.ok(Math.abs(hiddenReasoning.tps! - 100 / 1.5) < 1e-9) // 100 tok / 1500ms
+
+// 同样有隐藏思考但走纯参数产出（output 全为工具参数）：分子 = output，TPS 正常
+const hiddenReasoningParam = computePerfSample(
+  am({ tokens: { input: 10, output: 75, reasoning: 2000, cache: { read: 0, write: 0 } } }),
+  [textPart(1500), toolPart(2000, 3000)],
+)!
+assert.ok(Math.abs(hiddenReasoningParam.tps! - 75 / 0.5) < 1e-9) // 工具窗口 1s 已扣 → genMs 500ms
+
+// 整包参数守卫：文本 290 chars → 100 tok / 2s = 50 tok/s；参数 1850 chars → 500 tok
+// 在 gap 100ms 内整块到达 → 隐含 5000 tok/s ≥ 5×50 → 命中：分子 = 600−500 = 100
+const bufferedStep = computePerfSample(
+  am({ time: { created: 1000, completed: 5000 }, tokens: { input: 10, output: 600, reasoning: 0, cache: { read: 0, write: 0 } } }),
+  [textPart(1500, "a".repeat(290), 3500), toolPart(3600, 4000, "a".repeat(1850))],
+)!
+assert.ok(Math.abs(bufferedStep.tps! - 100 / 3.1) < 1e-9) // genMs = 5000−1500−400
+
+// 对照：同样参数量但 gap 900ms（真实流式）→ 保持全量口径 600/3.1
+const streamedStep = computePerfSample(
+  am({ time: { created: 1000, completed: 5000 }, tokens: { input: 10, output: 600, reasoning: 0, cache: { read: 0, write: 0 } } }),
+  [textPart(1500, "a".repeat(290), 3500), toolPart(4400, 4800, "a".repeat(1850))],
+)!
+assert.ok(Math.abs(streamedStep.tps! - 600 / 3.1) < 1e-9)
+
+// 隐藏思考 + 整包参数叠加：分子 = output − 参数（思考已剔、参数再剔）
+const comboStep = computePerfSample(
+  am({ time: { created: 1000, completed: 5000 }, tokens: { input: 10, output: 600, reasoning: 3000, cache: { read: 0, write: 0 } } }),
+  [textPart(1500, "a".repeat(290), 3500), toolPart(3600, 4000, "a".repeat(1850))],
+)!
+assert.ok(Math.abs(comboStep.tps! - 100 / 3.1) < 1e-9)
 
 // 工具区间扣除
 const withTool = computePerfSample(

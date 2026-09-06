@@ -1,7 +1,7 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { AssistantMessage, Message } from "@opencode-ai/sdk"
 import type { Part } from "@opencode-ai/sdk/v2"
-import { estimateTokens, num } from "./tokens"
+import { ASCII_PER_TOKEN, estimateTokens, num } from "./tokens"
 
 // ── performance (TTFT / TPS / latency) ──
 // 口径（在 opencode-throughput / tokenwatch 上的修正版）：
@@ -9,6 +9,12 @@ import { estimateTokens, num } from "./tokens"
 //          （体感口径：含 DB 写、预处理与建连等待，略大于 provider 报告的 TTFT）
 //   净生成 = time.completed − 首个 part start − 工具执行窗口∩生成区间
 //   TPS   = (output + reasoning) / 净生成 × 1000   ← 供应商全量生成 token
+//          （例外 1——隐藏思考：usage 计入 reasoningTokens 但无流式 reasoning
+//            part（chat-completions o 系等）：思考解码期不可观测、分母从首个
+//            text part 起算，保留思考 token 会数量级虚高 → 分子退回 output，
+//            与实时估算"只数流式可见"一致）
+//          （例外 2——整包参数：缓冲 router 把工具参数整包送达时分子剔除
+//            参数估算、退回可见口径；判据与方向见 BUFFERED_* 常量注释）
 //   延迟  = time.completed − time.created − 工具执行窗口∩生成区间（净模型耗时）
 // 分子为供应商精确 output_tokens（含 tool_use 参数 JSON），分母仅扣"工具执行
 // 等待"（tool-call→tool-result 的 state.time 区间，并行去重、钳位）。
@@ -29,6 +35,19 @@ export const BUFFER_MS_PER_TOKEN = 0.2
 // 实时估算守卫：生成窗口 <500ms 或产出 <8 token 时波动过大，不显示速度
 export const LIVE_MIN_GEN_MS = 500
 export const LIVE_MIN_TOK = 8
+// 整包参数守卫：缓冲 router 把工具参数作为整块 chunk 送达（不流式经过可见
+// 窗口）时，参数 token 计入分子而解码时间不在分母 → TPS 虚高。检测（首工具，
+// 单次 LLM 调用内全部工具参数都流式于 [前置内容末端, 首工具 start] 窗口）：
+//   ① 参数估算 ≥ BUFFERED_MIN_PARAM_TOK
+//   ② 参数窗口 gap = 首工具 state.time.start − 前置内容 part 末端 ≤ BUFFERED_GAP_MS
+//   ③ 隐含参数速度 ≥ BUFFERED_SPEED_RATIO × 同窗口文本流式速度
+// 三者同时命中 → 该步分子剔除工具参数估算（退回可见口径）。阈值取宽（实测
+// 正常流式的 deepseek 误伤 1/586 步），且方向保守：最多退回可见速度，不会
+// 产生虚高值；文本速度用 O(1) 长度近似（CJK 混排会低估 visTps → 偏向触发，
+// 由 gap 上界兜底：参数真实流式必占时间，不可能挤进 ≤150ms 窗口）。
+export const BUFFERED_GAP_MS = 150
+export const BUFFERED_MIN_PARAM_TOK = 30
+export const BUFFERED_SPEED_RATIO = 5
 
 /**
  * 合并工具执行区间（并行重叠去重），并钳位到 [lo, hi]（hi 省略表示无上界），
@@ -58,6 +77,43 @@ export interface PerfSample {
   latency: number
 }
 
+/**
+ * 工具参数原文：优先 state.raw（模型生成的原始参数文本），回退 state.input 序列化。
+ * 序列化抛错（循环引用等）按空串处理。
+ */
+function toolParamText(p: Part): string {
+  const st = (p as { state?: { raw?: unknown; input?: unknown } }).state
+  try {
+    if (typeof st?.raw === "string" && st.raw) return st.raw
+    return st?.input != null ? JSON.stringify(st.input) : ""
+  } catch { return "" }
+}
+
+/**
+ * 整包参数守卫（见 BUFFERED_* 注释）：命中返回应从分子剔除的参数估算，未命中返回 0。
+ */
+function bufferedParamTok(
+  toolRefs: readonly { start: number; part: Part }[],
+  contentRefs: readonly { end: number; len: number; reasoning: boolean }[],
+  fs: number,
+): number {
+  const fts = Math.min(...toolRefs.map((t) => t.start))
+  const pre = contentRefs.filter((c) => c.end <= fts)
+  if (pre.length === 0) return 0
+  const anchor = Math.max(...pre.map((c) => c.end))
+  const gap = fts - anchor
+  if (gap > BUFFERED_GAP_MS) return 0
+  let visTok = 0
+  for (const c of pre) visTok += Math.ceil(c.len / (c.reasoning ? ASCII_PER_TOKEN.thinking : ASCII_PER_TOKEN.answer))
+  const visMs = anchor - fs
+  const visTps = visMs > 0 ? (visTok / visMs) * 1000 : 0
+  if (visTps <= 0) return 0
+  const paramTok = toolRefs.reduce((n, t) => n + Math.ceil(toolParamText(t.part).length / ASCII_PER_TOKEN.code), 0)
+  if (paramTok < BUFFERED_MIN_PARAM_TOK) return 0
+  if ((paramTok / Math.max(gap, 1)) * 1000 < visTps * BUFFERED_SPEED_RATIO) return 0
+  return paramTok
+}
+
 // ── per-message perf sample ──
 // 单条 assistant 消息的性能样本（精确口径唯一实现）：侧边栏「性能」累计与
 // hint 栏 lastTps 共用。条件：已完成、无错误、非压缩、产出 token>0、有内容
@@ -69,42 +125,60 @@ export function computePerfSample(
   const created = am.time?.created
   const completed = am.time?.completed
   if (!created || !completed || am.error || am.summary) return null
-  // 产出 = output + reasoning（思考 token）：窗口含思考段，分子须同口径
   const outputTok = num(am.tokens?.output)
   const reasoningTok = num(am.tokens?.reasoning)
-  const genTok = outputTok + reasoningTok
-  if (genTok <= 0) return null
+  if (outputTok + reasoningTok <= 0) return null
   // 首内容 part 的 time.start = 首 token 到达时刻（text-start / reasoning-start
   // 打戳，取最早）；工具执行窗口扣减 [tool-call 起, tool-result 止] 的
   // state.time 区间。分子用供应商全量 output_tokens（含工具参数 JSON）——
   // 参数生成期（pending 段）无时间戳、留分母，与"参数已全量计入分子"
-  // 方向相反、相互弱化（详见头部口径说明）。
+  // 方向相反、相互弱化；缓冲 router 的整包参数例外由下方守卫剔除
+  // （详见头部口径说明）。
   let firstStart: number | undefined
   let toolIvs: [number, number][] | null = null
+  let hasReasoning = false
+  const toolRefs: { start: number; part: Part }[] = []
+  const contentRefs: { end: number; len: number; reasoning: boolean }[] = []
   for (const p of parts) {
     if (p.type === "tool") {
       const tw = (p as any).state?.time
-      if (typeof tw?.start === "number" && tw.start > 0 && typeof tw.end === "number" && tw.end > tw.start) {
-        toolIvs ??= []
-        toolIvs.push([tw.start, tw.end])
+      if (typeof tw?.start === "number" && tw.start > 0) {
+        toolRefs.push({ start: tw.start, part: p })
+        if (typeof tw.end === "number" && tw.end > tw.start) {
+          toolIvs ??= []
+          toolIvs.push([tw.start, tw.end])
+        }
       }
       continue
     }
     if (p.type !== "text" && p.type !== "reasoning") continue
-    const st = (p as any).time?.start
-    if (typeof st === "number" && st > 0 && (firstStart === undefined || st < firstStart)) firstStart = st
+    if (p.type === "reasoning") hasReasoning = true
+    const tm = (p as { time?: { start?: number; end?: number } }).time
+    const st = tm?.start
+    if (typeof st !== "number" || st <= 0) continue
+    const text = (p as { text?: unknown }).text
+    contentRefs.push({
+      end: typeof tm?.end === "number" && tm.end > st ? tm.end : st,
+      len: typeof text === "string" ? text.length : 0,
+      reasoning: p.type === "reasoning",
+    })
+    if (firstStart === undefined || st < firstStart) firstStart = st
   }
   if (firstStart === undefined || firstStart <= created) return null
+  // 隐藏思考：无流式 reasoning part → 思考解码时间不可观测，分子退回 output（见头部例外 1）
+  let genTok = reasoningTok > 0 && !hasReasoning ? outputTok : outputTok + reasoningTok
   const fs = firstStart
   // 合并工具执行窗口（并行区间重叠去重），钳位到 [fs, completed] 后扣除：
   // 首内容前的工具时间不参与扣减——它被计入 TTFT（体感口径），latency 同基准。
   // 已知偏差：[start,end] 为纯执行窗口，参数生成期无时间戳（含在延迟与净生成内）。
   const toolMs = toolIvs ? mergedIntervalMs(toolIvs, fs, completed) : 0
+  // 整包参数守卫（见 BUFFERED_* 注释）：命中时从分子剔除参数估算
+  if (toolRefs.length) genTok = Math.max(0, genTok - bufferedParamTok(toolRefs, contentRefs, fs))
   const ttft = fs - created
   const genMs = Math.max(0, completed - fs - toolMs)
   const latency = Math.max(0, completed - created - toolMs)
   // 守卫（小步噪声 / 缓冲网关）触发：TPS 记 null，ttft/latency 照常
-  const tps = genMs >= Math.max(MIN_GEN_MS, genTok * BUFFER_MS_PER_TOKEN) ? (genTok / genMs) * 1000 : null
+  const tps = genTok > 0 && genMs >= Math.max(MIN_GEN_MS, genTok * BUFFER_MS_PER_TOKEN) ? (genTok / genMs) * 1000 : null
   return { ttft, tps, latency }
 }
 
@@ -288,11 +362,8 @@ export function computeLivePerf(api: TuiPluginApi, sid: string): LivePerf | null
             toolIvs ??= []
             toolIvs.push([ts, t1])
           }
-          try {
-            const s = (p as { state?: { raw?: unknown; input?: unknown } }).state
-            const rawText = typeof s?.raw === "string" && s.raw ? s.raw : JSON.stringify(s?.input)
-            if (rawText) estTok += estimateTokens(rawText, "code")
-          } catch { /* 序列化循环引用 → 跳过 */ }
+          const rawText = toolParamText(p)
+          if (rawText) estTok += estimateTokens(rawText, "code")
         }
         continue
       }
